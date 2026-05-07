@@ -9,6 +9,8 @@ pub enum AppleObject {
     String { data: Vec<u8>, encoding: u64 },
     Data { data: Vec<u8> },
     Array { values: Vec<u64> },
+    Dictionary { entries: Vec<(u64, u64)> },
+    Number { value: i64 },
     Certificate { data_ref: u64 },
     PolicySsl { server: bool, hostname: u64 },
     Trust { certificates: u64, policies: u64 },
@@ -34,6 +36,17 @@ impl Default for AppleRuntime {
 }
 
 impl AppleRuntime {
+    const TYPE_ID_STRING: u64 = 0x1001;
+    const TYPE_ID_DATA: u64 = 0x1002;
+    const TYPE_ID_ARRAY: u64 = 0x1003;
+    const TYPE_ID_DICTIONARY: u64 = 0x1004;
+    const TYPE_ID_NUMBER: u64 = 0x1005;
+    const TYPE_ID_CERTIFICATE: u64 = 0x1006;
+    const TYPE_ID_POLICY_SSL: u64 = 0x1007;
+    const TYPE_ID_TRUST: u64 = 0x1008;
+    const TYPE_ID_DATE: u64 = 0x1009;
+    const TYPE_ID_ERROR: u64 = 0x100A;
+
     pub fn retain(&self, handle: u64) -> u64 {
         handle
     }
@@ -54,6 +67,35 @@ impl AppleRuntime {
 
     pub fn alloc_array(&mut self) -> u64 {
         self.alloc(AppleObject::Array { values: Vec::new() })
+    }
+
+    pub fn alloc_array_with_values(&mut self, values: Vec<u64>) -> u64 {
+        self.alloc(AppleObject::Array { values })
+    }
+
+    pub fn alloc_dictionary(&mut self, entries: Vec<(u64, u64)>) -> u64 {
+        self.alloc(AppleObject::Dictionary { entries })
+    }
+
+    pub fn dictionary_get(&self, dict_ref: u64, key_ref: u64) -> Option<u64> {
+        match self.objects.get(&dict_ref) {
+            Some(AppleObject::Dictionary { entries }) => entries
+                .iter()
+                .find(|(key, _)| *key == key_ref)
+                .map(|(_, value)| *value),
+            _ => None,
+        }
+    }
+
+    pub fn alloc_number(&mut self, value: i64) -> u64 {
+        self.alloc(AppleObject::Number { value })
+    }
+
+    pub fn number_value(&self, number_ref: u64) -> Option<i64> {
+        match self.objects.get(&number_ref) {
+            Some(AppleObject::Number { value }) => Some(*value),
+            _ => None,
+        }
     }
 
     pub fn array_append(&mut self, array_ref: u64, value: u64) -> bool {
@@ -139,6 +181,26 @@ impl AppleRuntime {
         })
     }
 
+    pub fn type_id(&self, handle: u64) -> u64 {
+        match self.objects.get(&handle) {
+            Some(AppleObject::String { .. }) => Self::TYPE_ID_STRING,
+            Some(AppleObject::Data { .. }) => Self::TYPE_ID_DATA,
+            Some(AppleObject::Array { .. }) => Self::TYPE_ID_ARRAY,
+            Some(AppleObject::Dictionary { .. }) => Self::TYPE_ID_DICTIONARY,
+            Some(AppleObject::Number { .. }) => Self::TYPE_ID_NUMBER,
+            Some(AppleObject::Certificate { .. }) => Self::TYPE_ID_CERTIFICATE,
+            Some(AppleObject::PolicySsl { .. }) => Self::TYPE_ID_POLICY_SSL,
+            Some(AppleObject::Trust { .. }) => Self::TYPE_ID_TRUST,
+            Some(AppleObject::Date { .. }) => Self::TYPE_ID_DATE,
+            Some(AppleObject::Error { .. }) => Self::TYPE_ID_ERROR,
+            None => 0,
+        }
+    }
+
+    pub fn number_type_id(&self) -> u64 {
+        Self::TYPE_ID_NUMBER
+    }
+
     pub fn error_code(&self, error_ref: u64) -> Option<i64> {
         match self.objects.get(&error_ref) {
             Some(AppleObject::Error { code, .. }) => Some(*code),
@@ -194,6 +256,10 @@ impl AppleRuntime {
                 crate::macos::lossy_data_preview(data, 64)
             ),
             Some(AppleObject::Array { values }) => format!("CFArray(count={})", values.len()),
+            Some(AppleObject::Dictionary { entries }) => {
+                format!("CFDictionary(count={})", entries.len())
+            }
+            Some(AppleObject::Number { value }) => format!("CFNumber({})", value),
             Some(AppleObject::Certificate { data_ref }) => {
                 format!("SecCertificate(data=0x{:X})", data_ref)
             }

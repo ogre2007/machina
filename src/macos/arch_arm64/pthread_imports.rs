@@ -11,7 +11,8 @@ macro_rules! println {
 use std::collections::HashMap;
 
 use crate::macos::arm64_runner_support::{
-    arm64_metadata, emit_arm64_event, record_arm64_import, Arm64ImportTracker, Arm64SharedState,
+    arm64_metadata, arm64_thread_event, emit_arm64_event, record_arm64_import, Arm64ImportTracker,
+    Arm64SharedState,
 };
 use crate::macos::{
     block_active_arm64_thread_on_cond, block_current_arm64_thread_on_cond,
@@ -29,6 +30,201 @@ pub fn install_arm64_pthread_imports(
     shared_state: &Arm64SharedState,
     import_tracker: &Arm64ImportTracker,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(&addr) = stub_map.get("_pthread_get_stackaddr_np") {
+        let thread_runtime = shared_state.thread_runtime.clone();
+        let import_tracker = import_tracker.clone();
+        let trace_bus_for_hook = trace_bus.clone();
+        emulator.add_code_hook(
+            addr,
+            addr + 4,
+            move |emu: &mut machina::UnicornEmulator, _address: u64, _size: u32| {
+                let requested_thread = emu.read_reg("x0").unwrap_or(0);
+                let (tid, stackaddr) = {
+                    let runtime = match thread_runtime.lock() {
+                        Ok(rt) => rt,
+                        Err(_) => return,
+                    };
+                    let tid = if requested_thread == 0 {
+                        runtime.current_thread_id.max(1)
+                    } else {
+                        requested_thread
+                    };
+                    let stackaddr = if tid == 1 {
+                        0x8000_0000_0000
+                    } else {
+                        runtime
+                            .next_stack_base
+                            .saturating_sub(crate::macos::ARM64_SYNTHETIC_THREAD_STACK_SIZE)
+                            .saturating_add(crate::macos::ARM64_SYNTHETIC_THREAD_STACK_SIZE)
+                    };
+                    (tid, stackaddr)
+                };
+                let lr = emu.read_reg("lr").unwrap_or(0);
+                let _ = emu.write_reg("x0", stackaddr);
+                if lr != 0 {
+                    let _ = emu.write_reg("pc", lr);
+                }
+                record_arm64_import(
+                    &import_tracker,
+                    format!(
+                        "_pthread_get_stackaddr_np(thread={}) -> 0x{:X}",
+                        tid, stackaddr
+                    ),
+                );
+                let event =
+                    arm64_thread_event(tid, "pthread_get_stackaddr_np", "pthread_get_stackaddr_np")
+                        .arg("Thread", tid.to_string())
+                        .arg("Result", format!("0x{:X}", stackaddr));
+                emit_arm64_event(&trace_bus_for_hook, event);
+            },
+        )?;
+    }
+
+    if let Some(&addr) = stub_map.get("_pthread_get_stacksize_np") {
+        let thread_runtime = shared_state.thread_runtime.clone();
+        let import_tracker = import_tracker.clone();
+        let trace_bus_for_hook = trace_bus.clone();
+        emulator.add_code_hook(
+            addr,
+            addr + 4,
+            move |emu: &mut machina::UnicornEmulator, _address: u64, _size: u32| {
+                let requested_thread = emu.read_reg("x0").unwrap_or(0);
+                let tid = {
+                    let runtime = match thread_runtime.lock() {
+                        Ok(rt) => rt,
+                        Err(_) => return,
+                    };
+                    if requested_thread == 0 {
+                        runtime.current_thread_id.max(1)
+                    } else {
+                        requested_thread
+                    }
+                };
+                let stacksize = if tid == 1 {
+                    0x20_0000
+                } else {
+                    crate::macos::ARM64_SYNTHETIC_THREAD_STACK_SIZE
+                };
+                let lr = emu.read_reg("lr").unwrap_or(0);
+                let _ = emu.write_reg("x0", stacksize);
+                if lr != 0 {
+                    let _ = emu.write_reg("pc", lr);
+                }
+                record_arm64_import(
+                    &import_tracker,
+                    format!(
+                        "_pthread_get_stacksize_np(thread={}) -> 0x{:X}",
+                        tid, stacksize
+                    ),
+                );
+                let event =
+                    arm64_thread_event(tid, "pthread_get_stacksize_np", "pthread_get_stacksize_np")
+                        .arg("Thread", tid.to_string())
+                        .arg("Result", format!("0x{:X}", stacksize));
+                emit_arm64_event(&trace_bus_for_hook, event);
+            },
+        )?;
+    }
+
+    if let Some(&addr) = stub_map.get("__tlv_bootstrap") {
+        let thread_runtime = shared_state.thread_runtime.clone();
+        let tlv_next_addr = shared_state.tlv_next_addr.clone();
+        let tlv_storage = shared_state.tlv_storage.clone();
+        let import_tracker = import_tracker.clone();
+        let trace_bus_for_hook = trace_bus.clone();
+        emulator.add_code_hook(
+            addr,
+            addr + 4,
+            move |emu: &mut machina::UnicornEmulator, _address: u64, _size: u32| {
+                let descriptor = emu.read_reg("x0").unwrap_or(0);
+                let thread_id = thread_runtime
+                    .lock()
+                    .ok()
+                    .map(|rt| rt.current_thread_id.max(1))
+                    .unwrap_or(1);
+                let value_addr = {
+                    let mut storage = match tlv_storage.lock() {
+                        Ok(storage) => storage,
+                        Err(_) => return,
+                    };
+                    if let Some(existing) = storage.get(&(thread_id, descriptor)).copied() {
+                        existing
+                    } else {
+                        let addr = {
+                            let mut next = match tlv_next_addr.lock() {
+                                Ok(next) => next,
+                                Err(_) => return,
+                            };
+                            let addr = *next;
+                            *next = next.saturating_add(0x1000);
+                            addr
+                        };
+                        let _ = emu.map_data_memory(addr, 0x1000);
+                        let _ = emu.write_memory(addr, &[0u8; 16]);
+                        storage.insert((thread_id, descriptor), addr);
+                        addr
+                    }
+                };
+                let lr = emu.read_reg("lr").unwrap_or(0);
+                let _ = emu.write_reg("x8", value_addr);
+                let _ = emu.write_reg("x0", value_addr);
+                if lr != 0 {
+                    let _ = emu.write_reg("pc", lr);
+                }
+                record_arm64_import(
+                    &import_tracker,
+                    format!(
+                        "__tlv_bootstrap(desc=0x{:X}, tid={}) -> 0x{:X}",
+                        descriptor, thread_id, value_addr
+                    ),
+                );
+                let event = arm64_thread_event(thread_id, "tlv-bootstrap", "__tlv_bootstrap")
+                    .arg("Descriptor", format!("0x{:X}", descriptor))
+                    .arg("Result", format!("0x{:X}", value_addr));
+                emit_arm64_event(&trace_bus_for_hook, event);
+            },
+        )?;
+    }
+
+    if let Some(&addr) = stub_map.get("__tlv_atexit") {
+        let import_tracker = import_tracker.clone();
+        let trace_bus_for_hook = trace_bus.clone();
+        let thread_runtime = shared_state.thread_runtime.clone();
+        emulator.add_code_hook(
+            addr,
+            addr + 8,
+            move |emu: &mut machina::UnicornEmulator, _address: u64, _size: u32| {
+                let dtor = emu.read_reg("x0").unwrap_or(0);
+                let object = emu.read_reg("x1").unwrap_or(0);
+                let thread_id = thread_runtime
+                    .lock()
+                    .ok()
+                    .map(|rt| rt.current_thread_id.max(1))
+                    .unwrap_or(1);
+                let lr = emu.read_reg("lr").unwrap_or(0);
+                let _ = emu.write_reg("x0", 0u64);
+                if lr != 0 {
+                    let _ = emu.write_reg("pc", lr);
+                }
+                record_arm64_import(
+                    &import_tracker,
+                    format!(
+                        "__tlv_atexit(dtor=0x{:X}, object=0x{:X}) -> 0",
+                        dtor, object
+                    ),
+                );
+                let event = thread_event(
+                    &arm64_metadata(None, thread_id),
+                    "tlv-atexit",
+                    "__tlv_atexit",
+                )
+                .arg("Dtor", format!("0x{:X}", dtor))
+                .arg("Object", format!("0x{:X}", object));
+                emit_arm64_event(&trace_bus_for_hook, event);
+            },
+        )?;
+    }
+
     if let Some(&addr) = stub_map.get("_pthread_key_create") {
         let tls_next_key = shared_state.tls_next_key.clone();
         let import_tracker = import_tracker.clone();
@@ -176,6 +372,248 @@ pub fn install_arm64_pthread_imports(
                     "pthread_self",
                 )
                 .arg("ThreadId", thread_id.to_string());
+                emit_arm64_event(&trace_bus_for_hook, event);
+            },
+        )?;
+    }
+
+    if let Some(&addr) = stub_map.get("_pthread_setname_np") {
+        let thread_runtime = shared_state.thread_runtime.clone();
+        let import_tracker = import_tracker.clone();
+        let trace_bus_for_hook = trace_bus.clone();
+        emulator.add_code_hook(
+            addr,
+            addr + 8,
+            move |emu: &mut machina::UnicornEmulator, _address: u64, _size: u32| {
+                let name_ptr = emu.read_reg("x0").unwrap_or(0);
+                let name = if name_ptr != 0 {
+                    crate::macos::read_cstring(emu, name_ptr, 256).unwrap_or_default()
+                } else {
+                    String::new()
+                };
+                let thread_id = thread_runtime
+                    .lock()
+                    .ok()
+                    .map(|rt| rt.current_thread_id.max(1))
+                    .unwrap_or(1);
+                let lr = emu.read_reg("lr").unwrap_or(0);
+                let _ = emu.write_reg("x0", 0u64);
+                if lr != 0 {
+                    let _ = emu.write_reg("pc", lr);
+                }
+                record_arm64_import(
+                    &import_tracker,
+                    format!(
+                        "_pthread_setname_np(tid={}, name={:?}) -> 0",
+                        thread_id, name
+                    ),
+                );
+                let event = thread_event(
+                    &arm64_metadata(None, thread_id),
+                    "pthread-setname",
+                    "pthread_setname_np",
+                )
+                .arg("ThreadId", thread_id.to_string())
+                .arg("Name", name);
+                emit_arm64_event(&trace_bus_for_hook, event);
+            },
+        )?;
+    }
+
+    if let Some(&addr) = stub_map.get("_dispatch_semaphore_create") {
+        let import_tracker = import_tracker.clone();
+        let trace_bus_for_hook = trace_bus.clone();
+        let next_handle = shared_state.dispatch_semaphore_next.clone();
+        let semaphores = shared_state.dispatch_semaphores.clone();
+        let thread_runtime = shared_state.thread_runtime.clone();
+        emulator.add_code_hook(
+            addr,
+            addr + 8,
+            move |emu: &mut machina::UnicornEmulator, _address: u64, _size: u32| {
+                let initial = emu.read_reg("x0").unwrap_or(0) as i64;
+                let handle = {
+                    let mut next = match next_handle.lock() {
+                        Ok(next) => next,
+                        Err(_) => return,
+                    };
+                    let handle = *next;
+                    *next = next.saturating_add(0x100);
+                    handle
+                };
+                if let Ok(mut map) = semaphores.lock() {
+                    map.insert(handle, initial);
+                }
+                let thread_id = thread_runtime
+                    .lock()
+                    .ok()
+                    .map(|rt| rt.current_thread_id.max(1))
+                    .unwrap_or(1);
+                let lr = emu.read_reg("lr").unwrap_or(0);
+                let _ = emu.write_reg("x0", handle);
+                if lr != 0 {
+                    let _ = emu.write_reg("pc", lr);
+                }
+                record_arm64_import(
+                    &import_tracker,
+                    format!(
+                        "_dispatch_semaphore_create(value={}) -> 0x{:X}",
+                        initial, handle
+                    ),
+                );
+                let event = thread_event(
+                    &arm64_metadata(None, thread_id),
+                    "dispatch-semaphore-create",
+                    "dispatch_semaphore_create",
+                )
+                .arg("Initial", initial.to_string())
+                .arg("Handle", format!("0x{:X}", handle));
+                emit_arm64_event(&trace_bus_for_hook, event);
+            },
+        )?;
+    }
+
+    if let Some(&addr) = stub_map.get("_dispatch_semaphore_signal") {
+        let import_tracker = import_tracker.clone();
+        let trace_bus_for_hook = trace_bus.clone();
+        let semaphores = shared_state.dispatch_semaphores.clone();
+        let thread_runtime = shared_state.thread_runtime.clone();
+        emulator.add_code_hook(
+            addr,
+            addr + 8,
+            move |emu: &mut machina::UnicornEmulator, _address: u64, _size: u32| {
+                let handle = emu.read_reg("x0").unwrap_or(0);
+                let value = {
+                    let mut map = match semaphores.lock() {
+                        Ok(map) => map,
+                        Err(_) => return,
+                    };
+                    let slot = map.entry(handle).or_insert(0);
+                    *slot = slot.saturating_add(1);
+                    *slot
+                };
+                let thread_id = thread_runtime
+                    .lock()
+                    .ok()
+                    .map(|rt| rt.current_thread_id.max(1))
+                    .unwrap_or(1);
+                let lr = emu.read_reg("lr").unwrap_or(0);
+                let _ = emu.write_reg("x0", 0u64);
+                if lr != 0 {
+                    let _ = emu.write_reg("pc", lr);
+                }
+                record_arm64_import(
+                    &import_tracker,
+                    format!(
+                        "_dispatch_semaphore_signal(handle=0x{:X}) -> {}",
+                        handle, value
+                    ),
+                );
+                let event = thread_event(
+                    &arm64_metadata(None, thread_id),
+                    "dispatch-semaphore-signal",
+                    "dispatch_semaphore_signal",
+                )
+                .arg("Handle", format!("0x{:X}", handle))
+                .arg("Value", value.to_string());
+                emit_arm64_event(&trace_bus_for_hook, event);
+            },
+        )?;
+    }
+
+    if let Some(&addr) = stub_map.get("_dispatch_semaphore_wait") {
+        let import_tracker = import_tracker.clone();
+        let trace_bus_for_hook = trace_bus.clone();
+        let semaphores = shared_state.dispatch_semaphores.clone();
+        let thread_runtime = shared_state.thread_runtime.clone();
+        emulator.add_code_hook(
+            addr,
+            addr + 8,
+            move |emu: &mut machina::UnicornEmulator, _address: u64, _size: u32| {
+                let handle = emu.read_reg("x0").unwrap_or(0);
+                let timeout = emu.read_reg("x1").unwrap_or(0);
+                let (value, result) = {
+                    let mut map = match semaphores.lock() {
+                        Ok(map) => map,
+                        Err(_) => return,
+                    };
+                    let slot = map.entry(handle).or_insert(0);
+                    if *slot > 0 {
+                        *slot -= 1;
+                        (*slot, 0u64)
+                    } else {
+                        (*slot, 0u64)
+                    }
+                };
+                let thread_id = thread_runtime
+                    .lock()
+                    .ok()
+                    .map(|rt| rt.current_thread_id.max(1))
+                    .unwrap_or(1);
+                let lr = emu.read_reg("lr").unwrap_or(0);
+                let _ = emu.write_reg("x0", result);
+                if lr != 0 {
+                    let _ = emu.write_reg("pc", lr);
+                }
+                record_arm64_import(
+                    &import_tracker,
+                    format!(
+                        "_dispatch_semaphore_wait(handle=0x{:X}, timeout=0x{:X}) -> {} value={}",
+                        handle, timeout, result, value
+                    ),
+                );
+                let event = thread_event(
+                    &arm64_metadata(None, thread_id),
+                    "dispatch-semaphore-wait",
+                    "dispatch_semaphore_wait",
+                )
+                .arg("Handle", format!("0x{:X}", handle))
+                .arg("Timeout", format!("0x{:X}", timeout))
+                .arg("Result", result.to_string())
+                .arg("Value", value.to_string());
+                emit_arm64_event(&trace_bus_for_hook, event);
+            },
+        )?;
+    }
+
+    if let Some(&addr) = stub_map.get("_dispatch_release") {
+        let import_tracker = import_tracker.clone();
+        let trace_bus_for_hook = trace_bus.clone();
+        let semaphores = shared_state.dispatch_semaphores.clone();
+        let thread_runtime = shared_state.thread_runtime.clone();
+        emulator.add_code_hook(
+            addr,
+            addr + 8,
+            move |emu: &mut machina::UnicornEmulator, _address: u64, _size: u32| {
+                let handle = emu.read_reg("x0").unwrap_or(0);
+                let existed = semaphores
+                    .lock()
+                    .ok()
+                    .and_then(|mut map| map.remove(&handle))
+                    .is_some();
+                let thread_id = thread_runtime
+                    .lock()
+                    .ok()
+                    .map(|rt| rt.current_thread_id.max(1))
+                    .unwrap_or(1);
+                let lr = emu.read_reg("lr").unwrap_or(0);
+                let _ = emu.write_reg("x0", 0u64);
+                if lr != 0 {
+                    let _ = emu.write_reg("pc", lr);
+                }
+                record_arm64_import(
+                    &import_tracker,
+                    format!(
+                        "_dispatch_release(handle=0x{:X}) -> existed={}",
+                        handle, existed
+                    ),
+                );
+                let event = thread_event(
+                    &arm64_metadata(None, thread_id),
+                    "dispatch-release",
+                    "dispatch_release",
+                )
+                .arg("Handle", format!("0x{:X}", handle))
+                .arg("Existed", existed.to_string());
                 emit_arm64_event(&trace_bus_for_hook, event);
             },
         )?;

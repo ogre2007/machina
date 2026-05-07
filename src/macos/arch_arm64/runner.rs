@@ -3,7 +3,8 @@
 use crate::macos::apple_imports::install_apple_imports;
 use crate::macos::binary_bootstrap::{map_binary_segments, setup_bootstrap_state};
 use crate::macos::binary_setup::{
-    find_runtime_symbols, log_runtime_symbols, patch_symbol_pointers, resolve_entry,
+    find_runtime_symbols, install_arm64_indirect_branch_hooks, install_arm64_lse_atomic_hooks,
+    log_runtime_symbols, patch_symbol_pointers, resolve_entry,
 };
 use crate::macos::diagnostics::{install_diagnostic_hooks, run_with_diagnostics, RunReport};
 use crate::macos::io_imports::install_io_imports;
@@ -60,6 +61,7 @@ pub fn emulate_macos_arm64_binary(binary_path: &str) -> Result<(), Box<dyn std::
     }
 
     let mut emulator = UnicornEmulator::new(ArchType::Arm64)?;
+    emulator.set_automap_low_page(true);
     let _ = emulator.install_unmapped_memory_debug_hook(&trace_bus);
 
     let stack_base: u64 = 0x7FFF_FFFC_0000;
@@ -84,6 +86,7 @@ pub fn emulate_macos_arm64_binary(binary_path: &str) -> Result<(), Box<dyn std::
     let mmap_next = bootstrap_state.mmap_next.clone();
     let errno_ptr = bootstrap_state.errno_ptr;
     let stub_region = bootstrap_state.stub_region;
+    let process_bootstrap = bootstrap_state.process_bootstrap;
     let stub_base = stub_region.base;
     let stub_size = stub_region.size;
     let done_addr = stub_region.done_addr;
@@ -117,10 +120,10 @@ pub fn emulate_macos_arm64_binary(binary_path: &str) -> Result<(), Box<dyn std::
     let import_count = import_tracker.import_count.clone();
     let recent_imports = import_tracker.recent_imports.clone();
 
-    let shared_state = initialize_shared_state(default_guest_fs_base(
-        std::path::Path::new(binary_path),
-        "arm64_ios",
-    ));
+    let shared_state = initialize_shared_state(
+        default_guest_fs_base(std::path::Path::new(binary_path), "arm64_ios"),
+        process_bootstrap,
+    );
     let usleep_streaks = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::<
         (u64, u64),
         u32,
@@ -191,11 +194,14 @@ pub fn emulate_macos_arm64_binary(binary_path: &str) -> Result<(), Box<dyn std::
     patch_symbol_pointers(
         &mut emulator,
         &binary,
+        &undefs,
         &stub_map,
         done_addr,
         &trace_bus,
         &process_name,
     )?;
+    install_arm64_lse_atomic_hooks(&mut emulator, &binary, &trace_bus, process_name)?;
+    install_arm64_indirect_branch_hooks(&mut emulator, &binary, &trace_bus, process_name)?;
 
     let runtime_context = RuntimeContext::new(
         process_name,
@@ -232,7 +238,7 @@ pub fn emulate_macos_arm64_binary(binary_path: &str) -> Result<(), Box<dyn std::
         process_name,
     )?;
 
-    run_with_diagnostics(
+    let result = run_with_diagnostics(
         &mut emulator,
         RunReport {
             actual_entry,
@@ -246,6 +252,39 @@ pub fn emulate_macos_arm64_binary(binary_path: &str) -> Result<(), Box<dyn std::
             import_count,
             last_stub,
             recent_imports,
+            trace_bus: trace_bus.clone(),
+            process_name: process_name.to_string(),
         },
-    )
+    );
+
+    if let Some(bus) = &trace_bus {
+        let recent_preview = import_tracker
+            .recent_imports
+            .lock()
+            .ok()
+            .map(|items| items.iter().cloned().collect::<Vec<_>>().join(" | "))
+            .unwrap_or_default();
+        let _ = bus.send(
+            process_event(&metadata, "trace-summary", "trace-summary")
+                .arg(
+                    "Syscalls",
+                    runtime_context
+                        .core
+                        .runtime
+                        .syscall_count
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                        .to_string(),
+                )
+                .arg(
+                    "Imports",
+                    import_tracker
+                        .import_count
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                        .to_string(),
+                )
+                .arg("RecentImports", recent_preview),
+        );
+    }
+
+    result
 }

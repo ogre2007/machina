@@ -20,8 +20,8 @@ jobs:
       run: cargo build --verbose
     - name: Run tests
       run: cargo test --verbose
-    - name: Run AMOS integration trace
+    - name: Run private-access integration trace
       run: cargo run --bin machina -- fixtures/macos/bin/2d0dda75bfc90e7ffda72640eb32c7ff9f51c90c30f4a6d1e05df93e58848f36.macho > amos-trace.jsonl
-    - name: Verify AMOS reaches private-file access logic
+    - name: Verify sample reaches private-file access logic
       run: python3 scripts/ci/check_amos_trace.py amos-trace.jsonl
           

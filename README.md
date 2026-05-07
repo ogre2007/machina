@@ -61,7 +61,7 @@ cargo run --bin machina -- fixtures\macos\bin\arm64_hello
 Generate a JSONL trace:
 
 ```powershell
-cargo run --bin machina -- fixtures\macos\bin\2d0dda75bfc90e7ffda72640eb32c7ff9f51c90c30f4a6d1e05df93e58848f36.macho > amos-trace.jsonl
+.\target\debug\machina.exe fixtures\macos\bin\2d0dda75bfc90e7ffda72640eb32c7ff9f51c90c30f4a6d1e05df93e58848f36.macho > amos-trace.jsonl
 ```
 
 Validate that execution reached stealer logic and private-file access:

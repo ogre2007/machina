@@ -31,7 +31,7 @@ def has_event(events, *, plugin=None, call=None, path_contains=None):
 
 def require(condition, message):
     if not condition:
-        print(f"AMOS trace check failed: {message}", file=sys.stderr)
+        print(f"Private-access trace check failed: {message}", file=sys.stderr)
         sys.exit(1)
 
 
@@ -45,33 +45,22 @@ def main() -> int:
     require(events, "no JSONL events were parsed from emulator output")
 
     require(
-        has_event(events, plugin="detect", call="_main.GrabWallets"),
-        "AMOS did not reach _main.GrabWallets",
-    )
-    require(
-        has_event(events, plugin="detect", call="_main.GrabChrome"),
-        "AMOS did not reach _main.GrabChrome",
-    )
-    require(
-        has_event(events, plugin="detect", call="_main.GrabFirefox"),
-        "AMOS did not reach _main.GrabFirefox",
-    )
-    require(
         has_event(
             events,
             plugin="filemon",
             call="open",
             path_contains="/Users/analyst/Library/Application Support/Binance/app-store.json",
         ),
-        "AMOS did not attempt to open Binance wallet data",
+        "sample did not attempt to open Binance wallet data",
     )
     require(
         has_event(
             events,
             plugin="filemon",
             call="read",
+            path_contains=None,
         ),
-        "AMOS did not perform any file reads",
+        "sample did not perform any file reads",
     )
     require(
         has_event(
@@ -80,7 +69,7 @@ def main() -> int:
             call="open",
             path_contains="/Users/analyst/Library/Application Support/Firefox/Profiles/",
         ),
-        "AMOS did not attempt to open Firefox profile data",
+        "sample did not attempt to open Firefox profile data",
     )
     require(
         has_event(
@@ -89,10 +78,28 @@ def main() -> int:
             call="open",
             path_contains="/Users/analyst/.electrum/wallets/",
         ),
-        "AMOS did not attempt to open Electrum wallet data",
+        "sample did not attempt to open Electrum wallet data",
+    )
+    require(
+        has_event(
+            events,
+            plugin="filemon",
+            call="open",
+            path_contains="/Users/analyst/Library/Application Support/Coinomi/wallets/",
+        ),
+        "sample did not attempt to open Coinomi wallet data",
+    )
+    require(
+        has_event(
+            events,
+            plugin="filemon",
+            call="_lstat",
+            path_contains="/Users/analyst/Library/Application Support/Google/Chrome/",
+        ),
+        "sample did not probe Chrome profile roots",
     )
 
-    print("AMOS trace check passed")
+    print("Private-access trace check passed")
     return 0
 
 

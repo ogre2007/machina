@@ -163,5 +163,5 @@ pub use syscall_plugins::{
 };
 pub use trace::{
     CallTracePlugin, PluginRegistry, StdoutTraceSink, StdoutTracer, TraceCategory, TraceConfig,
-    TraceEvent, TraceFormat, TracePlugin, TraceSink, Tracer, WriterTraceSink,
+    TraceEvent, TraceFormat, TracePlugin, TraceProfile, TraceSink, Tracer, WriterTraceSink,
 };

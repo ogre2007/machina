@@ -8,8 +8,9 @@ use crate::macos::plugin_events::import_event;
 use crate::macos::{
     emit_runner_trace_event, io_event, kqueue_event, memory_event, process_event,
     push_recent_trace, runtime_process_metadata, thread_event, AppleRuntime,
-    Arm64SyntheticOsRuntime, Arm64ThreadRuntime, Emulator, GuestFileTable, SharedTraceBus,
-    StubRegion, SyntheticProcess, TraceEvent, TraceMetadata, ARM64_SYNTHETIC_THREAD_STACK_BASE,
+    Arm64SyntheticOsRuntime, Arm64ThreadRuntime, Emulator, GuestFileTable, GuestProcessBootstrap,
+    SharedTraceBus, StubRegion, SyntheticProcess, TraceEvent, TraceMetadata,
+    ARM64_SYNTHETIC_THREAD_STACK_BASE,
 };
 use crate::UnicornEmulator;
 
@@ -22,8 +23,15 @@ pub struct Arm64ImportTracker {
 
 #[derive(Clone, Debug)]
 pub struct Arm64SharedState {
+    pub process_bootstrap: GuestProcessBootstrap,
     pub tls_next_key: Arc<Mutex<u64>>,
     pub tls_values: Arc<Mutex<HashMap<u64, u64>>>,
+    pub tlv_next_addr: Arc<Mutex<u64>>,
+    pub tlv_storage: Arc<Mutex<HashMap<(u64, u64), u64>>>,
+    pub malloc_next_addr: Arc<Mutex<u64>>,
+    pub malloc_allocations: Arc<Mutex<HashMap<u64, u64>>>,
+    pub dispatch_semaphore_next: Arc<Mutex<u64>>,
+    pub dispatch_semaphores: Arc<Mutex<HashMap<u64, i64>>>,
     pub thread_runtime: Arc<Mutex<Arm64ThreadRuntime>>,
     pub os_runtime: Arc<Mutex<Arm64SyntheticOsRuntime>>,
     pub apple_runtime: Arc<Mutex<AppleRuntime>>,
@@ -85,11 +93,21 @@ pub fn initialize_arm64_import_tracker() -> Arm64ImportTracker {
     }
 }
 
-pub fn initialize_arm64_shared_state(guest_fs_base: std::path::PathBuf) -> Arm64SharedState {
+pub fn initialize_arm64_shared_state(
+    guest_fs_base: std::path::PathBuf,
+    process_bootstrap: GuestProcessBootstrap,
+) -> Arm64SharedState {
     let guest_files = GuestFileTable::new(guest_fs_base.clone());
     Arm64SharedState {
+        process_bootstrap,
         tls_next_key: Arc::new(Mutex::new(1)),
         tls_values: Arc::new(Mutex::new(HashMap::new())),
+        tlv_next_addr: Arc::new(Mutex::new(0x5100_0000)),
+        tlv_storage: Arc::new(Mutex::new(HashMap::new())),
+        malloc_next_addr: Arc::new(Mutex::new(0x5200_0000)),
+        malloc_allocations: Arc::new(Mutex::new(HashMap::new())),
+        dispatch_semaphore_next: Arc::new(Mutex::new(0x6D15_0000_0000)),
+        dispatch_semaphores: Arc::new(Mutex::new(HashMap::new())),
         thread_runtime: Arc::new(Mutex::new(Arm64ThreadRuntime {
             next_thread_id: 2,
             current_thread_id: 1,

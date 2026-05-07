@@ -13,8 +13,8 @@ use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 
 use crate::macos::arm64_runner_support::{
-    arm64_io_event, arm64_kqueue_event, arm64_memory_event, emit_arm64_event, record_arm64_import,
-    Arm64ImportTracker, Arm64SharedState,
+    arm64_io_event, arm64_kqueue_event, arm64_memory_event, arm64_process_event, emit_arm64_event,
+    record_arm64_import, Arm64ImportTracker, Arm64SharedState,
 };
 use crate::macos::{
     align_up, bind_process_fd_target, close_directory_stream, close_synthetic_fd,
@@ -49,6 +49,40 @@ fn read_cstring(emu: &mut dyn Emulator, addr: u64, max_len: usize) -> String {
         out.push(byte);
     }
     String::from_utf8_lossy(&out).into_owned()
+}
+
+fn find_env_value_ptr(
+    emu: &mut dyn Emulator,
+    envp_addr: u64,
+    name: &str,
+    max_entries: usize,
+) -> u64 {
+    if envp_addr == 0 || name.is_empty() || name.contains('=') {
+        return 0;
+    }
+    for index in 0..max_entries {
+        let ptr_addr = envp_addr + (index as u64 * 8);
+        let Ok(raw_ptr) = emu.read_memory(ptr_addr, 8) else {
+            break;
+        };
+        let Some(env_addr) = vec_u64_le(raw_ptr) else {
+            break;
+        };
+        if env_addr == 0 {
+            break;
+        }
+        let entry = read_cstring(emu, env_addr, 512);
+        let Some((entry_name, value)) = entry.split_once('=') else {
+            continue;
+        };
+        if entry_name == name {
+            return env_addr + entry_name.len() as u64 + 1;
+        }
+        if value.is_empty() {
+            continue;
+        }
+    }
+    0
 }
 
 fn write_fake_stat(emu: &mut dyn Emulator, buf: u64, size: u64) {
@@ -88,6 +122,27 @@ fn write_fake_dirent(
     let _ = emu.write_memory(entry_buf, &out);
 }
 
+fn fcntl_cmd_name(cmd: u64) -> &'static str {
+    match cmd {
+        1 => "F_GETFD",
+        2 => "F_SETFD",
+        3 => "F_GETFL",
+        4 => "F_SETFL",
+        67 => "F_DUPFD_CLOEXEC",
+        _ => "UNKNOWN",
+    }
+}
+
+fn sysconf_name(name: u64) -> &'static str {
+    match name {
+        29 => "_SC_PAGESIZE",
+        30 => "_SC_PAGE_SIZE",
+        57 => "_SC_NPROCESSORS_CONF",
+        58 => "_SC_NPROCESSORS_ONLN",
+        _ => "UNKNOWN",
+    }
+}
+
 pub fn install_arm64_io_imports(
     emulator: &mut UnicornEmulator,
     stub_map: &HashMap<String, u64>,
@@ -98,6 +153,10 @@ pub fn install_arm64_io_imports(
     shared_state: &Arm64SharedState,
     import_tracker: &Arm64ImportTracker,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let malloc_allocations = shared_state.malloc_allocations.clone();
+    let malloc_next_addr = shared_state.malloc_next_addr.clone();
+    let process_bootstrap = shared_state.process_bootstrap;
+
     if let Some(&addr) = stub_map.get("_kqueue") {
         let os_runtime = shared_state.os_runtime.clone();
         let thread_runtime = shared_state.thread_runtime.clone();
@@ -360,6 +419,32 @@ pub fn install_arm64_io_imports(
                     .arg("Nevents", nevents.to_string())
                     .arg("Emitted", emitted.to_string())
                     .arg("TimeoutPtr", format!("0x{:X}", timeout_ptr));
+                let event = if !change_summaries.is_empty() {
+                    event.arg(
+                        "Changes",
+                        change_summaries
+                            .iter()
+                            .take(4)
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .join(" | "),
+                    )
+                } else {
+                    event
+                };
+                let event = if !emitted_summaries.is_empty() {
+                    event.arg(
+                        "Ready",
+                        emitted_summaries
+                            .iter()
+                            .take(4)
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .join(" | "),
+                    )
+                } else {
+                    event
+                };
                 emit_arm64_event(&trace_bus_for_hook, event);
             },
         )?;
@@ -451,7 +536,9 @@ pub fn install_arm64_io_imports(
 
     if let Some(&addr) = stub_map.get("_fcntl") {
         let os_runtime = shared_state.os_runtime.clone();
+        let thread_runtime = shared_state.thread_runtime.clone();
         let import_tracker = import_tracker.clone();
+        let trace_bus_for_hook = trace_bus.clone();
         emulator.add_code_hook(
             addr,
             addr + 4,
@@ -459,6 +546,16 @@ pub fn install_arm64_io_imports(
                 let fd = emu.read_reg("x0").unwrap_or(0);
                 let cmd = emu.read_reg("x1").unwrap_or(0);
                 let arg = emu.read_reg("x2").unwrap_or(0);
+                let current_tid = thread_runtime
+                    .lock()
+                    .ok()
+                    .map(|rt| rt.current_thread_id.max(1))
+                    .unwrap_or(1);
+                let current_pid = os_runtime
+                    .lock()
+                    .ok()
+                    .and_then(|os| os.thread_processes.get(&current_tid).copied())
+                    .unwrap_or(1);
                 let result = {
                     let mut os = match os_runtime.lock() {
                         Ok(os) => os,
@@ -486,6 +583,682 @@ pub fn install_arm64_io_imports(
                         fd, cmd, arg, result
                     ),
                 );
+                let event = arm64_io_event(current_pid, current_tid, "fcntl")
+                    .arg("Fd", fd.to_string())
+                    .arg("Cmd", cmd.to_string())
+                    .arg("CmdName", fcntl_cmd_name(cmd))
+                    .arg("Arg", format!("0x{:X}", arg))
+                    .arg("Result", format!("0x{:X}", result));
+                emit_arm64_event(&trace_bus_for_hook, event);
+            },
+        )?;
+    }
+
+    if let Some(&addr) = stub_map.get("_signal") {
+        let os_runtime = shared_state.os_runtime.clone();
+        let thread_runtime = shared_state.thread_runtime.clone();
+        let import_tracker = import_tracker.clone();
+        let trace_bus_for_hook = trace_bus.clone();
+        emulator.add_code_hook(
+            addr,
+            addr + 4,
+            move |emu: &mut machina::UnicornEmulator, _address: u64, _size: u32| {
+                let signum = emu.read_reg("x0").unwrap_or(0);
+                let handler = emu.read_reg("x1").unwrap_or(0);
+                let current_tid = thread_runtime
+                    .lock()
+                    .ok()
+                    .map(|rt| rt.current_thread_id.max(1))
+                    .unwrap_or(1);
+                let current_pid = os_runtime
+                    .lock()
+                    .ok()
+                    .and_then(|os| os.thread_processes.get(&current_tid).copied())
+                    .unwrap_or(1);
+                let lr = emu.read_reg("lr").unwrap_or(0);
+                let _ = emu.write_reg("x0", 0u64);
+                if lr != 0 {
+                    let _ = emu.write_reg("pc", lr);
+                }
+                record_arm64_import(
+                    &import_tracker,
+                    format!("_signal(signum={}, handler=0x{:X}) -> 0x0", signum, handler),
+                );
+                let event = arm64_io_event(current_pid, current_tid, "signal")
+                    .arg("Signal", signum.to_string())
+                    .arg("Handler", format!("0x{:X}", handler))
+                    .arg("Result", "0x0");
+                emit_arm64_event(&trace_bus_for_hook, event);
+            },
+        )?;
+    }
+
+    if let Some(&addr) = stub_map.get("_memcpy") {
+        let thread_runtime = shared_state.thread_runtime.clone();
+        let os_runtime = shared_state.os_runtime.clone();
+        let import_tracker = import_tracker.clone();
+        let trace_bus_for_hook = trace_bus.clone();
+        emulator.add_code_hook(
+            addr,
+            addr + 8,
+            move |emu: &mut machina::UnicornEmulator, _address: u64, _size: u32| {
+                let dst = emu.read_reg("x0").unwrap_or(0);
+                let src = emu.read_reg("x1").unwrap_or(0);
+                let len = emu.read_reg("x2").unwrap_or(0) as usize;
+                if dst != 0 && src != 0 && len != 0 {
+                    if let Ok(bytes) = emu.read_memory(src, len) {
+                        let _ = emu.write_memory(dst, &bytes);
+                    }
+                }
+                let current_tid = thread_runtime
+                    .lock()
+                    .ok()
+                    .map(|rt| rt.current_thread_id.max(1))
+                    .unwrap_or(1);
+                let current_pid = os_runtime
+                    .lock()
+                    .ok()
+                    .and_then(|os| os.thread_processes.get(&current_tid).copied())
+                    .unwrap_or(1);
+                let lr = emu.read_reg("lr").unwrap_or(0);
+                let _ = emu.write_reg("x0", dst);
+                if lr != 0 {
+                    let _ = emu.write_reg("pc", lr);
+                }
+                record_arm64_import(
+                    &import_tracker,
+                    format!(
+                        "_memcpy(dst=0x{:X}, src=0x{:X}, len=0x{:X}) -> 0x{:X}",
+                        dst, src, len, dst
+                    ),
+                );
+                let event = arm64_memory_event("memcpy")
+                    .arg("Dst", format!("0x{:X}", dst))
+                    .arg("Src", format!("0x{:X}", src))
+                    .arg("Len", format!("0x{:X}", len))
+                    .arg("Pid", current_pid.to_string())
+                    .arg("Tid", current_tid.to_string());
+                emit_arm64_event(&trace_bus_for_hook, event);
+            },
+        )?;
+    }
+
+    if let Some(&addr) = stub_map.get("_memmove") {
+        let thread_runtime = shared_state.thread_runtime.clone();
+        let os_runtime = shared_state.os_runtime.clone();
+        let import_tracker = import_tracker.clone();
+        let trace_bus_for_hook = trace_bus.clone();
+        emulator.add_code_hook(
+            addr,
+            addr + 8,
+            move |emu: &mut machina::UnicornEmulator, _address: u64, _size: u32| {
+                let dst = emu.read_reg("x0").unwrap_or(0);
+                let src = emu.read_reg("x1").unwrap_or(0);
+                let len = emu.read_reg("x2").unwrap_or(0) as usize;
+                if dst != 0 && src != 0 && len != 0 {
+                    if let Ok(bytes) = emu.read_memory(src, len) {
+                        let _ = emu.write_memory(dst, &bytes);
+                    }
+                }
+                let current_tid = thread_runtime
+                    .lock()
+                    .ok()
+                    .map(|rt| rt.current_thread_id.max(1))
+                    .unwrap_or(1);
+                let current_pid = os_runtime
+                    .lock()
+                    .ok()
+                    .and_then(|os| os.thread_processes.get(&current_tid).copied())
+                    .unwrap_or(1);
+                let lr = emu.read_reg("lr").unwrap_or(0);
+                let _ = emu.write_reg("x0", dst);
+                if lr != 0 {
+                    let _ = emu.write_reg("pc", lr);
+                }
+                record_arm64_import(
+                    &import_tracker,
+                    format!(
+                        "_memmove(dst=0x{:X}, src=0x{:X}, len=0x{:X}) -> 0x{:X}",
+                        dst, src, len, dst
+                    ),
+                );
+                let event = arm64_memory_event("memmove")
+                    .arg("Dst", format!("0x{:X}", dst))
+                    .arg("Src", format!("0x{:X}", src))
+                    .arg("Len", format!("0x{:X}", len))
+                    .arg("Pid", current_pid.to_string())
+                    .arg("Tid", current_tid.to_string());
+                emit_arm64_event(&trace_bus_for_hook, event);
+            },
+        )?;
+    }
+
+    if let Some(&addr) = stub_map.get("_memset") {
+        let thread_runtime = shared_state.thread_runtime.clone();
+        let os_runtime = shared_state.os_runtime.clone();
+        let import_tracker = import_tracker.clone();
+        let trace_bus_for_hook = trace_bus.clone();
+        emulator.add_code_hook(
+            addr,
+            addr + 8,
+            move |emu: &mut machina::UnicornEmulator, _address: u64, _size: u32| {
+                let dst = emu.read_reg("x0").unwrap_or(0);
+                let value = emu.read_reg("x1").unwrap_or(0) as u8;
+                let len = emu.read_reg("x2").unwrap_or(0) as usize;
+                if dst != 0 && len != 0 {
+                    let _ = emu.write_memory(dst, &vec![value; len]);
+                }
+                let current_tid = thread_runtime
+                    .lock()
+                    .ok()
+                    .map(|rt| rt.current_thread_id.max(1))
+                    .unwrap_or(1);
+                let current_pid = os_runtime
+                    .lock()
+                    .ok()
+                    .and_then(|os| os.thread_processes.get(&current_tid).copied())
+                    .unwrap_or(1);
+                let lr = emu.read_reg("lr").unwrap_or(0);
+                let _ = emu.write_reg("x0", dst);
+                if lr != 0 {
+                    let _ = emu.write_reg("pc", lr);
+                }
+                record_arm64_import(
+                    &import_tracker,
+                    format!(
+                        "_memset(dst=0x{:X}, value=0x{:X}, len=0x{:X}) -> 0x{:X}",
+                        dst, value, len, dst
+                    ),
+                );
+                let event = arm64_memory_event("memset")
+                    .arg("Dst", format!("0x{:X}", dst))
+                    .arg("Value", format!("0x{:X}", value))
+                    .arg("Len", format!("0x{:X}", len))
+                    .arg("Pid", current_pid.to_string())
+                    .arg("Tid", current_tid.to_string());
+                emit_arm64_event(&trace_bus_for_hook, event);
+            },
+        )?;
+    }
+
+    if let Some(&addr) = stub_map.get("_memcmp") {
+        let thread_runtime = shared_state.thread_runtime.clone();
+        let os_runtime = shared_state.os_runtime.clone();
+        let import_tracker = import_tracker.clone();
+        let trace_bus_for_hook = trace_bus.clone();
+        emulator.add_code_hook(
+            addr,
+            addr + 8,
+            move |emu: &mut machina::UnicornEmulator, _address: u64, _size: u32| {
+                let left = emu.read_reg("x0").unwrap_or(0);
+                let right = emu.read_reg("x1").unwrap_or(0);
+                let len = emu.read_reg("x2").unwrap_or(0) as usize;
+                let result = if left == 0 || right == 0 || len == 0 {
+                    0i64
+                } else {
+                    let left_bytes = emu.read_memory(left, len).unwrap_or_default();
+                    let right_bytes = emu.read_memory(right, len).unwrap_or_default();
+                    let mut cmp = 0i64;
+                    for (lhs, rhs) in left_bytes.iter().zip(right_bytes.iter()) {
+                        if lhs != rhs {
+                            cmp = (*lhs as i64) - (*rhs as i64);
+                            break;
+                        }
+                    }
+                    cmp
+                };
+                let current_tid = thread_runtime
+                    .lock()
+                    .ok()
+                    .map(|rt| rt.current_thread_id.max(1))
+                    .unwrap_or(1);
+                let current_pid = os_runtime
+                    .lock()
+                    .ok()
+                    .and_then(|os| os.thread_processes.get(&current_tid).copied())
+                    .unwrap_or(1);
+                let lr = emu.read_reg("lr").unwrap_or(0);
+                let _ = emu.write_reg("x0", result as u64);
+                if lr != 0 {
+                    let _ = emu.write_reg("pc", lr);
+                }
+                record_arm64_import(
+                    &import_tracker,
+                    format!(
+                        "_memcmp(left=0x{:X}, right=0x{:X}, len=0x{:X}) -> {}",
+                        left, right, len, result
+                    ),
+                );
+                let event = arm64_memory_event("memcmp")
+                    .arg("Left", format!("0x{:X}", left))
+                    .arg("Right", format!("0x{:X}", right))
+                    .arg("Len", format!("0x{:X}", len))
+                    .arg("Result", result.to_string())
+                    .arg("Pid", current_pid.to_string())
+                    .arg("Tid", current_tid.to_string());
+                emit_arm64_event(&trace_bus_for_hook, event);
+            },
+        )?;
+    }
+
+    if let Some(&addr) = stub_map.get("_calloc").or_else(|| stub_map.get("_cmalloc")) {
+        let thread_runtime = shared_state.thread_runtime.clone();
+        let os_runtime = shared_state.os_runtime.clone();
+        let import_tracker = import_tracker.clone();
+        let trace_bus_for_hook = trace_bus.clone();
+        let malloc_next_addr = malloc_next_addr.clone();
+        let malloc_allocations = malloc_allocations.clone();
+        emulator.add_code_hook(
+            addr,
+            addr + 8,
+            move |emu: &mut machina::UnicornEmulator, _address: u64, _size: u32| {
+                let nmemb = emu.read_reg("x0").unwrap_or(0);
+                let size = emu.read_reg("x1").unwrap_or(0);
+                let total = nmemb.saturating_mul(size).max(1);
+                let aligned = (total + 0xFFF) & !0xFFF;
+                let result = {
+                    let mut next = match malloc_next_addr.lock() {
+                        Ok(next) => next,
+                        Err(_) => return,
+                    };
+                    let addr = (*next + 0xF) & !0xF;
+                    *next = addr.saturating_add(aligned);
+                    let _ = emu.map_data_memory(addr, aligned);
+                    let _ = emu.write_memory(addr, &vec![0u8; total as usize]);
+                    if let Ok(mut allocations) = malloc_allocations.lock() {
+                        allocations.insert(addr, total);
+                    }
+                    addr
+                };
+                let current_tid = thread_runtime
+                    .lock()
+                    .ok()
+                    .map(|rt| rt.current_thread_id.max(1))
+                    .unwrap_or(1);
+                let current_pid = os_runtime
+                    .lock()
+                    .ok()
+                    .and_then(|os| os.thread_processes.get(&current_tid).copied())
+                    .unwrap_or(1);
+                let lr = emu.read_reg("lr").unwrap_or(0);
+                let _ = emu.write_reg("x0", result);
+                if lr != 0 {
+                    let _ = emu.write_reg("pc", lr);
+                }
+                record_arm64_import(
+                    &import_tracker,
+                    format!(
+                        "_calloc(nmemb=0x{:X}, size=0x{:X}) -> 0x{:X}",
+                        nmemb, size, result
+                    ),
+                );
+                let event = arm64_memory_event("calloc")
+                    .arg("Nmemb", format!("0x{:X}", nmemb))
+                    .arg("Size", format!("0x{:X}", size))
+                    .arg("Result", format!("0x{:X}", result))
+                    .arg("Pid", current_pid.to_string())
+                    .arg("Tid", current_tid.to_string());
+                emit_arm64_event(&trace_bus_for_hook, event);
+            },
+        )?;
+    }
+
+    if let Some(&addr) = stub_map.get("_realloc") {
+        let thread_runtime = shared_state.thread_runtime.clone();
+        let os_runtime = shared_state.os_runtime.clone();
+        let import_tracker = import_tracker.clone();
+        let trace_bus_for_hook = trace_bus.clone();
+        let malloc_next_addr = malloc_next_addr.clone();
+        let malloc_allocations = malloc_allocations.clone();
+        emulator.add_code_hook(
+            addr,
+            addr + 8,
+            move |emu: &mut machina::UnicornEmulator, _address: u64, _size: u32| {
+                let old_ptr = emu.read_reg("x0").unwrap_or(0);
+                let new_size = emu.read_reg("x1").unwrap_or(0).max(1);
+                let aligned = (new_size + 0xFFF) & !0xFFF;
+                let result = {
+                    let mut next = match malloc_next_addr.lock() {
+                        Ok(next) => next,
+                        Err(_) => return,
+                    };
+                    let new_ptr = (*next + 0xF) & !0xF;
+                    *next = new_ptr.saturating_add(aligned);
+                    let _ = emu.map_data_memory(new_ptr, aligned);
+                    let old_size = malloc_allocations
+                        .lock()
+                        .ok()
+                        .and_then(|allocs| allocs.get(&old_ptr).copied())
+                        .unwrap_or(0);
+                    let copy_size = old_size.min(new_size) as usize;
+                    if old_ptr != 0 && copy_size != 0 {
+                        if let Ok(bytes) = emu.read_memory(old_ptr, copy_size) {
+                            let _ = emu.write_memory(new_ptr, &bytes);
+                        }
+                    }
+                    if let Ok(mut allocations) = malloc_allocations.lock() {
+                        allocations.remove(&old_ptr);
+                        allocations.insert(new_ptr, new_size);
+                    }
+                    new_ptr
+                };
+                let current_tid = thread_runtime
+                    .lock()
+                    .ok()
+                    .map(|rt| rt.current_thread_id.max(1))
+                    .unwrap_or(1);
+                let current_pid = os_runtime
+                    .lock()
+                    .ok()
+                    .and_then(|os| os.thread_processes.get(&current_tid).copied())
+                    .unwrap_or(1);
+                let lr = emu.read_reg("lr").unwrap_or(0);
+                let _ = emu.write_reg("x0", result);
+                if lr != 0 {
+                    let _ = emu.write_reg("pc", lr);
+                }
+                record_arm64_import(
+                    &import_tracker,
+                    format!(
+                        "_realloc(ptr=0x{:X}, size=0x{:X}) -> 0x{:X}",
+                        old_ptr, new_size, result
+                    ),
+                );
+                let event = arm64_memory_event("realloc")
+                    .arg("OldPtr", format!("0x{:X}", old_ptr))
+                    .arg("Size", format!("0x{:X}", new_size))
+                    .arg("Result", format!("0x{:X}", result))
+                    .arg("Pid", current_pid.to_string())
+                    .arg("Tid", current_tid.to_string());
+                emit_arm64_event(&trace_bus_for_hook, event);
+            },
+        )?;
+    }
+
+    if let Some(&addr) = stub_map.get("_free") {
+        let thread_runtime = shared_state.thread_runtime.clone();
+        let os_runtime = shared_state.os_runtime.clone();
+        let import_tracker = import_tracker.clone();
+        let trace_bus_for_hook = trace_bus.clone();
+        let malloc_allocations = malloc_allocations.clone();
+        emulator.add_code_hook(
+            addr,
+            addr + 8,
+            move |emu: &mut machina::UnicornEmulator, _address: u64, _size: u32| {
+                let ptr = emu.read_reg("x0").unwrap_or(0);
+                if let Ok(mut allocations) = malloc_allocations.lock() {
+                    allocations.remove(&ptr);
+                }
+                let current_tid = thread_runtime
+                    .lock()
+                    .ok()
+                    .map(|rt| rt.current_thread_id.max(1))
+                    .unwrap_or(1);
+                let current_pid = os_runtime
+                    .lock()
+                    .ok()
+                    .and_then(|os| os.thread_processes.get(&current_tid).copied())
+                    .unwrap_or(1);
+                let lr = emu.read_reg("lr").unwrap_or(0);
+                let _ = emu.write_reg("x0", 0u64);
+                if lr != 0 {
+                    let _ = emu.write_reg("pc", lr);
+                }
+                record_arm64_import(&import_tracker, format!("_free(ptr=0x{:X})", ptr));
+                let event = arm64_memory_event("free")
+                    .arg("Ptr", format!("0x{:X}", ptr))
+                    .arg("Pid", current_pid.to_string())
+                    .arg("Tid", current_tid.to_string());
+                emit_arm64_event(&trace_bus_for_hook, event);
+            },
+        )?;
+    }
+
+    if let Some(&addr) = stub_map.get("_sysconf") {
+        let os_runtime = shared_state.os_runtime.clone();
+        let thread_runtime = shared_state.thread_runtime.clone();
+        let import_tracker = import_tracker.clone();
+        let trace_bus_for_hook = trace_bus.clone();
+        emulator.add_code_hook(
+            addr,
+            addr + 4,
+            move |emu: &mut machina::UnicornEmulator, _address: u64, _size: u32| {
+                let name = emu.read_reg("x0").unwrap_or(0);
+                let result = match name {
+                    29 | 30 => 4096,
+                    57 | 58 => 8,
+                    _ => 1,
+                };
+                let current_tid = thread_runtime
+                    .lock()
+                    .ok()
+                    .map(|rt| rt.current_thread_id.max(1))
+                    .unwrap_or(1);
+                let current_pid = os_runtime
+                    .lock()
+                    .ok()
+                    .and_then(|os| os.thread_processes.get(&current_tid).copied())
+                    .unwrap_or(1);
+                let lr = emu.read_reg("lr").unwrap_or(0);
+                let _ = emu.write_reg("x0", result);
+                if lr != 0 {
+                    let _ = emu.write_reg("pc", lr);
+                }
+                record_arm64_import(
+                    &import_tracker,
+                    format!(
+                        "_sysconf(name={} {}) -> {}",
+                        name,
+                        sysconf_name(name),
+                        result
+                    ),
+                );
+                let event = arm64_io_event(current_pid, current_tid, "sysconf")
+                    .arg("Name", name.to_string())
+                    .arg("NameStr", sysconf_name(name))
+                    .arg("Result", result.to_string());
+                emit_arm64_event(&trace_bus_for_hook, event);
+            },
+        )?;
+    }
+
+    if let Some(&addr) = stub_map.get("__NSGetArgc") {
+        let os_runtime = shared_state.os_runtime.clone();
+        let thread_runtime = shared_state.thread_runtime.clone();
+        let import_tracker = import_tracker.clone();
+        let trace_bus_for_hook = trace_bus.clone();
+        emulator.add_code_hook(
+            addr,
+            addr + 4,
+            move |emu: &mut machina::UnicornEmulator, _address: u64, _size: u32| {
+                let current_tid = thread_runtime
+                    .lock()
+                    .ok()
+                    .map(|rt| rt.current_thread_id.max(1))
+                    .unwrap_or(1);
+                let current_pid = os_runtime
+                    .lock()
+                    .ok()
+                    .and_then(|os| os.thread_processes.get(&current_tid).copied())
+                    .unwrap_or(1);
+                let result = process_bootstrap.argc_addr;
+                let lr = emu.read_reg("lr").unwrap_or(0);
+                let _ = emu.write_reg("x0", result);
+                if lr != 0 {
+                    let _ = emu.write_reg("pc", lr);
+                }
+                record_arm64_import(&import_tracker, format!("__NSGetArgc() -> 0x{:X}", result));
+                let event =
+                    arm64_process_event(current_pid, current_tid, "ns-getargc", "__NSGetArgc")
+                        .arg("Result", format!("0x{:X}", result))
+                        .arg("Argc", process_bootstrap.argc.to_string());
+                emit_arm64_event(&trace_bus_for_hook, event);
+            },
+        )?;
+    }
+
+    if let Some(&addr) = stub_map.get("__NSGetArgv") {
+        let os_runtime = shared_state.os_runtime.clone();
+        let thread_runtime = shared_state.thread_runtime.clone();
+        let import_tracker = import_tracker.clone();
+        let trace_bus_for_hook = trace_bus.clone();
+        emulator.add_code_hook(
+            addr,
+            addr + 4,
+            move |emu: &mut machina::UnicornEmulator, _address: u64, _size: u32| {
+                let current_tid = thread_runtime
+                    .lock()
+                    .ok()
+                    .map(|rt| rt.current_thread_id.max(1))
+                    .unwrap_or(1);
+                let current_pid = os_runtime
+                    .lock()
+                    .ok()
+                    .and_then(|os| os.thread_processes.get(&current_tid).copied())
+                    .unwrap_or(1);
+                let result = process_bootstrap.ns_argv_ptr_addr;
+                let lr = emu.read_reg("lr").unwrap_or(0);
+                let _ = emu.write_reg("x0", result);
+                if lr != 0 {
+                    let _ = emu.write_reg("pc", lr);
+                }
+                record_arm64_import(&import_tracker, format!("__NSGetArgv() -> 0x{:X}", result));
+                let event =
+                    arm64_process_event(current_pid, current_tid, "ns-getargv", "__NSGetArgv")
+                        .arg("Result", format!("0x{:X}", result))
+                        .arg("Argv", format!("0x{:X}", process_bootstrap.argv_addr));
+                emit_arm64_event(&trace_bus_for_hook, event);
+            },
+        )?;
+    }
+
+    if let Some(&addr) = stub_map.get("__NSGetEnviron") {
+        let os_runtime = shared_state.os_runtime.clone();
+        let thread_runtime = shared_state.thread_runtime.clone();
+        let import_tracker = import_tracker.clone();
+        let trace_bus_for_hook = trace_bus.clone();
+        emulator.add_code_hook(
+            addr,
+            addr + 4,
+            move |emu: &mut machina::UnicornEmulator, _address: u64, _size: u32| {
+                let current_tid = thread_runtime
+                    .lock()
+                    .ok()
+                    .map(|rt| rt.current_thread_id.max(1))
+                    .unwrap_or(1);
+                let current_pid = os_runtime
+                    .lock()
+                    .ok()
+                    .and_then(|os| os.thread_processes.get(&current_tid).copied())
+                    .unwrap_or(1);
+                let result = process_bootstrap.ns_envp_ptr_addr;
+                let lr = emu.read_reg("lr").unwrap_or(0);
+                let _ = emu.write_reg("x0", result);
+                if lr != 0 {
+                    let _ = emu.write_reg("pc", lr);
+                }
+                record_arm64_import(
+                    &import_tracker,
+                    format!("__NSGetEnviron() -> 0x{:X}", result),
+                );
+                let event = arm64_process_event(
+                    current_pid,
+                    current_tid,
+                    "ns-getenviron",
+                    "__NSGetEnviron",
+                )
+                .arg("Result", format!("0x{:X}", result))
+                .arg("Envp", format!("0x{:X}", process_bootstrap.envp_addr));
+                emit_arm64_event(&trace_bus_for_hook, event);
+            },
+        )?;
+    }
+
+    if let Some(&addr) = stub_map.get("_getenv") {
+        let os_runtime = shared_state.os_runtime.clone();
+        let thread_runtime = shared_state.thread_runtime.clone();
+        let import_tracker = import_tracker.clone();
+        let trace_bus_for_hook = trace_bus.clone();
+        emulator.add_code_hook(
+            addr,
+            addr + 4,
+            move |emu: &mut machina::UnicornEmulator, _address: u64, _size: u32| {
+                let name_ptr = emu.read_reg("x0").unwrap_or(0);
+                let name = read_cstring(emu, name_ptr, 128);
+                let result = find_env_value_ptr(emu, process_bootstrap.envp_addr, &name, 64);
+                let current_tid = thread_runtime
+                    .lock()
+                    .ok()
+                    .map(|rt| rt.current_thread_id.max(1))
+                    .unwrap_or(1);
+                let current_pid = os_runtime
+                    .lock()
+                    .ok()
+                    .and_then(|os| os.thread_processes.get(&current_tid).copied())
+                    .unwrap_or(1);
+                let lr = emu.read_reg("lr").unwrap_or(0);
+                let _ = emu.write_reg("x0", result);
+                if lr != 0 {
+                    let _ = emu.write_reg("pc", lr);
+                }
+                record_arm64_import(
+                    &import_tracker,
+                    format!("_getenv(name={:?}) -> 0x{:X}", name, result),
+                );
+                let event = arm64_process_event(current_pid, current_tid, "getenv", "getenv")
+                    .arg("Name", name)
+                    .arg("Result", format!("0x{:X}", result));
+                emit_arm64_event(&trace_bus_for_hook, event);
+            },
+        )?;
+    }
+
+    if let Some(&addr) = stub_map.get("_strlen") {
+        let os_runtime = shared_state.os_runtime.clone();
+        let thread_runtime = shared_state.thread_runtime.clone();
+        let import_tracker = import_tracker.clone();
+        let trace_bus_for_hook = trace_bus.clone();
+        emulator.add_code_hook(
+            addr,
+            addr + 8,
+            move |emu: &mut machina::UnicornEmulator, _address: u64, _size: u32| {
+                let str_ptr = emu.read_reg("x0").unwrap_or(0);
+                let mut len = 0u64;
+                while len < 0x10000 {
+                    let Ok(bytes) = emu.read_memory(str_ptr.saturating_add(len), 1) else {
+                        break;
+                    };
+                    let Some(&byte) = bytes.first() else {
+                        break;
+                    };
+                    if byte == 0 {
+                        break;
+                    }
+                    len = len.saturating_add(1);
+                }
+                let current_tid = thread_runtime
+                    .lock()
+                    .ok()
+                    .map(|rt| rt.current_thread_id.max(1))
+                    .unwrap_or(1);
+                let current_pid = os_runtime
+                    .lock()
+                    .ok()
+                    .and_then(|os| os.thread_processes.get(&current_tid).copied())
+                    .unwrap_or(1);
+                let lr = emu.read_reg("lr").unwrap_or(0);
+                let _ = emu.write_reg("x0", len);
+                if lr != 0 {
+                    let _ = emu.write_reg("pc", lr);
+                }
+                record_arm64_import(
+                    &import_tracker,
+                    format!("_strlen(str=0x{:X}) -> {}", str_ptr, len),
+                );
+                let event = arm64_process_event(current_pid, current_tid, "strlen", "strlen")
+                    .arg("Ptr", format!("0x{:X}", str_ptr))
+                    .arg("Result", len.to_string());
+                emit_arm64_event(&trace_bus_for_hook, event);
             },
         )?;
     }
@@ -1187,6 +1960,139 @@ pub fn install_arm64_io_imports(
                     &import_tracker,
                     format!("_getrlimit(resource={}, rlp=0x{:X}) -> 0", resource, rlp),
                 );
+            },
+        )?;
+    }
+
+    if let Some(&addr) = stub_map.get("_sigaction") {
+        let thread_runtime = shared_state.thread_runtime.clone();
+        let os_runtime = shared_state.os_runtime.clone();
+        let import_tracker = import_tracker.clone();
+        let trace_bus_for_hook = trace_bus.clone();
+        emulator.add_code_hook(
+            addr,
+            addr + 8,
+            move |emu: &mut machina::UnicornEmulator, _address: u64, _size: u32| {
+                let signum = emu.read_reg("x0").unwrap_or(0);
+                let act = emu.read_reg("x1").unwrap_or(0);
+                let oldact = emu.read_reg("x2").unwrap_or(0);
+                if oldact != 0 {
+                    let _ = emu.write_memory(oldact, &[0u8; 32]);
+                }
+                let current_tid = thread_runtime
+                    .lock()
+                    .ok()
+                    .map(|rt| rt.current_thread_id.max(1))
+                    .unwrap_or(1);
+                let current_pid = os_runtime
+                    .lock()
+                    .ok()
+                    .and_then(|os| os.thread_processes.get(&current_tid).copied())
+                    .unwrap_or(1);
+                let lr = emu.read_reg("lr").unwrap_or(0);
+                let _ = emu.write_reg("x0", 0u64);
+                if lr != 0 {
+                    let _ = emu.write_reg("pc", lr);
+                }
+                record_arm64_import(
+                    &import_tracker,
+                    format!(
+                        "_sigaction(signum={}, act=0x{:X}, oldact=0x{:X}) -> 0",
+                        signum, act, oldact
+                    ),
+                );
+                let event = arm64_process_event(current_pid, current_tid, "sigaction", "sigaction")
+                    .arg("Signal", signum.to_string())
+                    .arg("Act", format!("0x{:X}", act))
+                    .arg("OldAct", format!("0x{:X}", oldact))
+                    .arg("Result", "0");
+                emit_arm64_event(&trace_bus_for_hook, event);
+            },
+        )?;
+    }
+
+    if let Some(&addr) = stub_map.get("_sigaltstack") {
+        let thread_runtime = shared_state.thread_runtime.clone();
+        let os_runtime = shared_state.os_runtime.clone();
+        let import_tracker = import_tracker.clone();
+        let trace_bus_for_hook = trace_bus.clone();
+        emulator.add_code_hook(
+            addr,
+            addr + 8,
+            move |emu: &mut machina::UnicornEmulator, _address: u64, _size: u32| {
+                let ss = emu.read_reg("x0").unwrap_or(0);
+                let old_ss = emu.read_reg("x1").unwrap_or(0);
+                if old_ss != 0 {
+                    let _ = emu.write_memory(old_ss, &[0u8; 24]);
+                }
+                let current_tid = thread_runtime
+                    .lock()
+                    .ok()
+                    .map(|rt| rt.current_thread_id.max(1))
+                    .unwrap_or(1);
+                let current_pid = os_runtime
+                    .lock()
+                    .ok()
+                    .and_then(|os| os.thread_processes.get(&current_tid).copied())
+                    .unwrap_or(1);
+                let lr = emu.read_reg("lr").unwrap_or(0);
+                let _ = emu.write_reg("x0", 0u64);
+                if lr != 0 {
+                    let _ = emu.write_reg("pc", lr);
+                }
+                record_arm64_import(
+                    &import_tracker,
+                    format!("_sigaltstack(ss=0x{:X}, old_ss=0x{:X}) -> 0", ss, old_ss),
+                );
+                let event =
+                    arm64_process_event(current_pid, current_tid, "sigaltstack", "sigaltstack")
+                        .arg("Stack", format!("0x{:X}", ss))
+                        .arg("OldStack", format!("0x{:X}", old_ss))
+                        .arg("Result", "0");
+                emit_arm64_event(&trace_bus_for_hook, event);
+            },
+        )?;
+    }
+
+    if let Some(&addr) = stub_map.get("_malloc") {
+        let malloc_next_addr = shared_state.malloc_next_addr.clone();
+        let malloc_allocations = shared_state.malloc_allocations.clone();
+        let import_tracker = import_tracker.clone();
+        let trace_bus_for_hook = trace_bus.clone();
+        emulator.add_code_hook(
+            addr,
+            addr + 8,
+            move |emu: &mut machina::UnicornEmulator, _address: u64, _size: u32| {
+                let requested = emu.read_reg("x0").unwrap_or(0);
+                let alloc_size = align_up(requested.max(1), 0x10);
+                let page_size = align_up(alloc_size, 0x1000);
+                let result = {
+                    let mut next = match malloc_next_addr.lock() {
+                        Ok(next) => next,
+                        Err(_) => return,
+                    };
+                    let addr = *next;
+                    *next = next.saturating_add(page_size);
+                    let _ = emu.map_data_memory(addr, page_size);
+                    let _ = emu.write_memory(addr, &vec![0u8; alloc_size as usize]);
+                    addr
+                };
+                if let Ok(mut allocations) = malloc_allocations.lock() {
+                    allocations.insert(result, alloc_size);
+                }
+                let lr = emu.read_reg("lr").unwrap_or(0);
+                let _ = emu.write_reg("x0", result);
+                if lr != 0 {
+                    let _ = emu.write_reg("pc", lr);
+                }
+                record_arm64_import(
+                    &import_tracker,
+                    format!("_malloc(size=0x{:X}) -> 0x{:X}", requested, result),
+                );
+                let event = arm64_memory_event("malloc")
+                    .arg("Size", format!("0x{:X}", requested))
+                    .arg("Result", format!("0x{:X}", result));
+                emit_arm64_event(&trace_bus_for_hook, event);
             },
         )?;
     }

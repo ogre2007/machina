@@ -27,5 +27,8 @@ core
 .env
 .venv/
 venv/
-log.txt
-amos-trace.jsonl
+*.txt
+*.jsonl
+*.nam
+*.til
+*.id*

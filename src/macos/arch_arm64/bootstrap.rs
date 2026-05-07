@@ -6,9 +6,11 @@ use std::sync::Arc;
 use crate::macos::{
     align_up, alloc_bytes, find_symbol_address, install_stub_region, io_event, memory_event,
     process_event, reload_file_backed_range, setup_arm64_stack_bootstrap, setup_guest_memory_arena,
-    GuestMemoryArenaConfig, SharedTraceBus, StubIsa, StubRegion, TraceMetadata,
+    GuestMemoryArenaConfig, GuestProcessBootstrap, SharedTraceBus, StubIsa, StubRegion,
+    TraceMetadata,
 };
 use crate::{Emulator, MachoBinary, UnicornEmulator};
+use unicorn_engine::Prot;
 
 #[derive(Debug)]
 pub struct Arm64BootstrapState {
@@ -18,6 +20,7 @@ pub struct Arm64BootstrapState {
     pub mmap_next: Arc<AtomicU64>,
     pub errno_ptr: u64,
     pub stub_region: StubRegion,
+    pub process_bootstrap: GuestProcessBootstrap,
 }
 
 pub fn map_arm64_binary_segments(
@@ -41,12 +44,13 @@ pub fn map_arm64_binary_segments(
         if seg.vmsize > 0 {
             let page_size = 0x1000;
             let aligned_size = ((seg.vmsize + page_size - 1) / page_size) * page_size;
-            emulator.map_code_memory(seg.vmaddr, aligned_size)?;
+            let initial_prot = Prot::READ | Prot::WRITE | Prot::EXEC;
+            emulator.map_memory_with_prot(seg.vmaddr, aligned_size, initial_prot)?;
             if let Some(bus) = trace_bus {
                 let _ = bus.send(
                     metadata.apply_to(
                         memory_event(&metadata, "map-segment")
-                            .arg("Segment", seg_name)
+                            .arg("Segment", seg_name.clone())
                             .arg("VmAddr", format!("0x{:X}", seg.vmaddr))
                             .arg("VmSize", format!("0x{:X}", seg.vmsize))
                             .arg("FileOff", format!("0x{:X}", seg.fileoff))
@@ -63,6 +67,20 @@ pub fn map_arm64_binary_segments(
                 }
             }
 
+            let final_prot = arm64_segment_prot(seg.initprot);
+            let _ = emulator.protect_memory(seg.vmaddr, aligned_size, final_prot);
+            if let Some(bus) = trace_bus {
+                let _ = bus.send(
+                    metadata.apply_to(
+                        memory_event(&metadata, "protect-segment")
+                            .arg("Segment", seg_name.clone())
+                            .arg("VmAddr", format!("0x{:X}", seg.vmaddr))
+                            .arg("VmSize", format!("0x{:X}", seg.vmsize))
+                            .arg("Prot", format!("{:?}", final_prot)),
+                    ),
+                );
+            }
+
             let seg_end = seg.vmaddr + seg.vmsize;
             if seg_end > max_addr {
                 max_addr = seg_end;
@@ -75,6 +93,24 @@ pub fn map_arm64_binary_segments(
     }
 
     Ok(max_addr)
+}
+
+fn arm64_segment_prot(initprot: i32) -> Prot {
+    let mut prot = Prot::NONE;
+    if initprot & crate::macos::loader::consts::vm_protection::VM_PROT_READ != 0 {
+        prot |= Prot::READ;
+    }
+    if initprot & crate::macos::loader::consts::vm_protection::VM_PROT_WRITE != 0 {
+        prot |= Prot::WRITE;
+    }
+    if initprot & crate::macos::loader::consts::vm_protection::VM_PROT_EXECUTE != 0 {
+        prot |= Prot::EXEC;
+    }
+    if prot == Prot::NONE {
+        Prot::READ
+    } else {
+        prot
+    }
 }
 
 pub fn setup_arm64_bootstrap_state(
@@ -145,5 +181,6 @@ pub fn setup_arm64_bootstrap_state(
         mmap_next,
         errno_ptr,
         stub_region,
+        process_bootstrap: bootstrap,
     })
 }

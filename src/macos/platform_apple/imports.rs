@@ -15,6 +15,24 @@ fn read_guest_bytes(emu: &mut dyn Emulator, addr: u64, len: usize, cap: usize) -
     emu.read_memory(addr, len.min(cap)).unwrap_or_default()
 }
 
+fn read_guest_u64_array(emu: &mut dyn Emulator, addr: u64, count: usize, cap: usize) -> Vec<u64> {
+    if addr == 0 || count == 0 {
+        return Vec::new();
+    }
+    let capped = count.min(cap);
+    let mut out = Vec::with_capacity(capped);
+    for i in 0..capped {
+        let Ok(bytes) = emu.read_memory(addr + (i as u64 * 8), 8) else {
+            break;
+        };
+        let Ok(array) = <[u8; 8]>::try_from(bytes.as_slice()) else {
+            break;
+        };
+        out.push(u64::from_le_bytes(array));
+    }
+    out
+}
+
 fn install_returning_hook<F>(
     emulator: &mut UnicornEmulator,
     addr: u64,
@@ -240,6 +258,40 @@ pub fn install_apple_imports(
             emit_arm64_event(
                 &trace,
                 process_event(&metadata, "cfarray", "CFArrayCreateMutable")
+                    .arg("Result", format!("0x{:X}", array_ref)),
+            );
+            array_ref
+        })?;
+    }
+
+    if let Some(&addr) = stub_map.get("_CFArrayCreate") {
+        let apple_runtime = shared_state.apple_runtime.clone();
+        let tracker = import_tracker.clone();
+        let trace = trace_bus.clone();
+        let metadata = metadata.clone();
+        install_returning_hook(emulator, addr, move |emu| {
+            let values_ptr = emu.read_reg("x1").unwrap_or(0);
+            let count = emu.read_reg("x2").unwrap_or(0) as usize;
+            let values = read_guest_u64_array(emu, values_ptr, count, 4096);
+            let array_ref = {
+                let mut runtime = match apple_runtime.lock() {
+                    Ok(runtime) => runtime,
+                    Err(_) => return 0,
+                };
+                runtime.alloc_array_with_values(values.clone())
+            };
+            record_arm64_import(
+                &tracker,
+                format!(
+                    "_CFArrayCreate(values=0x{:X}, count={}) -> 0x{:X}",
+                    values_ptr, count, array_ref
+                ),
+            );
+            emit_arm64_event(
+                &trace,
+                process_event(&metadata, "cfarray", "CFArrayCreate")
+                    .arg("Values", format!("0x{:X}", values_ptr))
+                    .arg("Count", count.to_string())
                     .arg("Result", format!("0x{:X}", array_ref)),
             );
             array_ref
@@ -484,6 +536,39 @@ pub fn install_apple_imports(
         })?;
     }
 
+    if let Some(&addr) = stub_map.get("_CFErrorCreate") {
+        let apple_runtime = shared_state.apple_runtime.clone();
+        let tracker = import_tracker.clone();
+        let trace = trace_bus.clone();
+        let metadata = metadata.clone();
+        install_returning_hook(emulator, addr, move |emu| {
+            let domain = emu.read_reg("x1").unwrap_or(0);
+            let code = emu.read_reg("x2").unwrap_or(0) as i64;
+            let error_ref = {
+                let mut runtime = match apple_runtime.lock() {
+                    Ok(runtime) => runtime,
+                    Err(_) => return 0,
+                };
+                runtime.alloc_error(code, format!("machina synthetic error {}", code))
+            };
+            record_arm64_import(
+                &tracker,
+                format!(
+                    "_CFErrorCreate(domain=0x{:X}, code={}) -> 0x{:X}",
+                    domain, code, error_ref
+                ),
+            );
+            emit_arm64_event(
+                &trace,
+                process_event(&metadata, "cferror", "CFErrorCreate")
+                    .arg("Domain", format!("0x{:X}", domain))
+                    .arg("Code", code.to_string())
+                    .arg("Result", format!("0x{:X}", error_ref)),
+            );
+            error_ref
+        })?;
+    }
+
     if let Some(&addr) = stub_map.get("_CFErrorCopyDescription") {
         let apple_runtime = shared_state.apple_runtime.clone();
         let tracker = import_tracker.clone();
@@ -515,6 +600,174 @@ pub fn install_apple_imports(
                     .arg("Result", format!("0x{:X}", description_ref)),
             );
             description_ref
+        })?;
+    }
+
+    if let Some(&addr) = stub_map.get("_CFDictionaryCreate") {
+        let apple_runtime = shared_state.apple_runtime.clone();
+        let tracker = import_tracker.clone();
+        let trace = trace_bus.clone();
+        let metadata = metadata.clone();
+        install_returning_hook(emulator, addr, move |emu| {
+            let keys_ptr = emu.read_reg("x1").unwrap_or(0);
+            let values_ptr = emu.read_reg("x2").unwrap_or(0);
+            let count = emu.read_reg("x3").unwrap_or(0) as usize;
+            let keys = read_guest_u64_array(emu, keys_ptr, count, 4096);
+            let values = read_guest_u64_array(emu, values_ptr, count, 4096);
+            let entries = keys.into_iter().zip(values).collect::<Vec<_>>();
+            let dict_ref = {
+                let mut runtime = match apple_runtime.lock() {
+                    Ok(runtime) => runtime,
+                    Err(_) => return 0,
+                };
+                runtime.alloc_dictionary(entries)
+            };
+            record_arm64_import(
+                &tracker,
+                format!(
+                    "_CFDictionaryCreate(keys=0x{:X}, values=0x{:X}, count={}) -> 0x{:X}",
+                    keys_ptr, values_ptr, count, dict_ref
+                ),
+            );
+            emit_arm64_event(
+                &trace,
+                process_event(&metadata, "cfdictionary", "CFDictionaryCreate")
+                    .arg("Keys", format!("0x{:X}", keys_ptr))
+                    .arg("Values", format!("0x{:X}", values_ptr))
+                    .arg("Count", count.to_string())
+                    .arg("Result", format!("0x{:X}", dict_ref)),
+            );
+            dict_ref
+        })?;
+    }
+
+    if let Some(&addr) = stub_map.get("_CFDictionaryGetValueIfPresent") {
+        let apple_runtime = shared_state.apple_runtime.clone();
+        let tracker = import_tracker.clone();
+        let trace = trace_bus.clone();
+        let metadata = metadata.clone();
+        install_returning_hook(emulator, addr, move |emu| {
+            let dict_ref = emu.read_reg("x0").unwrap_or(0);
+            let key_ref = emu.read_reg("x1").unwrap_or(0);
+            let value_out = emu.read_reg("x2").unwrap_or(0);
+            let value_ref = {
+                let runtime = match apple_runtime.lock() {
+                    Ok(runtime) => runtime,
+                    Err(_) => return 0,
+                };
+                runtime.dictionary_get(dict_ref, key_ref).unwrap_or(0)
+            };
+            let present = value_ref != 0;
+            if present && value_out != 0 {
+                let _ = emu.write_memory(value_out, &value_ref.to_le_bytes());
+            }
+            record_arm64_import(
+                &tracker,
+                format!(
+                    "_CFDictionaryGetValueIfPresent(dict=0x{:X}, key=0x{:X}, out=0x{:X}) -> {}",
+                    dict_ref, key_ref, value_out, present as u64
+                ),
+            );
+            emit_arm64_event(
+                &trace,
+                process_event(&metadata, "cfdictionary", "CFDictionaryGetValueIfPresent")
+                    .arg("Dictionary", format!("0x{:X}", dict_ref))
+                    .arg("Key", format!("0x{:X}", key_ref))
+                    .arg("ValueOut", format!("0x{:X}", value_out))
+                    .arg("Value", format!("0x{:X}", value_ref))
+                    .arg("Present", present.to_string()),
+            );
+            present as u64
+        })?;
+    }
+
+    if let Some(&addr) = stub_map.get("_CFGetTypeID") {
+        let apple_runtime = shared_state.apple_runtime.clone();
+        let tracker = import_tracker.clone();
+        let trace = trace_bus.clone();
+        let metadata = metadata.clone();
+        install_returning_hook(emulator, addr, move |emu| {
+            let object_ref = emu.read_reg("x0").unwrap_or(0);
+            let type_id = {
+                let runtime = match apple_runtime.lock() {
+                    Ok(runtime) => runtime,
+                    Err(_) => return 0,
+                };
+                runtime.type_id(object_ref)
+            };
+            record_arm64_import(
+                &tracker,
+                format!("_CFGetTypeID(obj=0x{:X}) -> 0x{:X}", object_ref, type_id),
+            );
+            emit_arm64_event(
+                &trace,
+                process_event(&metadata, "cfobject", "CFGetTypeID")
+                    .arg("Object", format!("0x{:X}", object_ref))
+                    .arg("Result", format!("0x{:X}", type_id)),
+            );
+            type_id
+        })?;
+    }
+
+    if let Some(&addr) = stub_map.get("_CFNumberGetTypeID") {
+        let apple_runtime = shared_state.apple_runtime.clone();
+        let tracker = import_tracker.clone();
+        let trace = trace_bus.clone();
+        let metadata = metadata.clone();
+        install_returning_hook(emulator, addr, move |_emu| {
+            let type_id = {
+                let runtime = match apple_runtime.lock() {
+                    Ok(runtime) => runtime,
+                    Err(_) => return 0,
+                };
+                runtime.number_type_id()
+            };
+            record_arm64_import(&tracker, format!("_CFNumberGetTypeID() -> 0x{:X}", type_id));
+            emit_arm64_event(
+                &trace,
+                process_event(&metadata, "cfnumber", "CFNumberGetTypeID")
+                    .arg("Result", format!("0x{:X}", type_id)),
+            );
+            type_id
+        })?;
+    }
+
+    if let Some(&addr) = stub_map.get("_CFNumberGetValue") {
+        let apple_runtime = shared_state.apple_runtime.clone();
+        let tracker = import_tracker.clone();
+        let trace = trace_bus.clone();
+        let metadata = metadata.clone();
+        install_returning_hook(emulator, addr, move |emu| {
+            let number_ref = emu.read_reg("x0").unwrap_or(0);
+            let number_type = emu.read_reg("x1").unwrap_or(0);
+            let out_ptr = emu.read_reg("x2").unwrap_or(0);
+            let value = {
+                let runtime = match apple_runtime.lock() {
+                    Ok(runtime) => runtime,
+                    Err(_) => return 0,
+                };
+                runtime.number_value(number_ref).unwrap_or(0)
+            };
+            if out_ptr != 0 {
+                let _ = emu.write_memory(out_ptr, &value.to_le_bytes());
+            }
+            record_arm64_import(
+                &tracker,
+                format!(
+                    "_CFNumberGetValue(num=0x{:X}, type=0x{:X}, out=0x{:X}) -> 1",
+                    number_ref, number_type, out_ptr
+                ),
+            );
+            emit_arm64_event(
+                &trace,
+                process_event(&metadata, "cfnumber", "CFNumberGetValue")
+                    .arg("Number", format!("0x{:X}", number_ref))
+                    .arg("Type", format!("0x{:X}", number_type))
+                    .arg("Out", format!("0x{:X}", out_ptr))
+                    .arg("Value", value.to_string())
+                    .arg("Result", "1"),
+            );
+            1
         })?;
     }
 

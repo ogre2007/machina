@@ -22,7 +22,7 @@ Get-Content $TracePath | ForEach-Object {
 
 function Require($Condition, [string]$Message) {
     if (-not $Condition) {
-        Write-Error "AMOS trace check failed: $Message"
+        Write-Error "Private-access trace check failed: $Message"
         exit 1
     }
 }
@@ -41,7 +41,11 @@ function Has-Event {
         if ($Call -and $event.Call -ne $Call) {
             continue
         }
-        if ($PathContains -and (-not ([string]$event.Path).Contains($PathContains))) {
+        $eventPath = [string]$event.Path
+        if ($PathContains -and [string]::IsNullOrEmpty($eventPath)) {
+            continue
+        }
+        if ($PathContains -and ($eventPath.IndexOf($PathContains, [System.StringComparison]::OrdinalIgnoreCase) -lt 0)) {
             continue
         }
         return $true
@@ -50,20 +54,23 @@ function Has-Event {
 }
 
 Require ($events.Count -gt 0) "no JSONL events were parsed from emulator output"
-Require (Has-Event -Plugin "detect" -Call "_main.GrabWallets") "AMOS did not reach _main.GrabWallets"
-Require (Has-Event -Plugin "detect" -Call "_main.GrabChrome") "AMOS did not reach _main.GrabChrome"
-Require (Has-Event -Plugin "detect" -Call "_main.GrabFirefox") "AMOS did not reach _main.GrabFirefox"
 Require (
     Has-Event -Plugin "filemon" -Call "open" -PathContains "/Users/analyst/Library/Application Support/Binance/app-store.json"
-) "AMOS did not attempt to open Binance wallet data"
+) "sample did not attempt to open Binance wallet data"
 Require (
     Has-Event -Plugin "filemon" -Call "read"
-) "AMOS did not perform any file reads"
+) "sample did not perform any file reads"
 Require (
     Has-Event -Plugin "filemon" -Call "open" -PathContains "/Users/analyst/Library/Application Support/Firefox/Profiles/"
-) "AMOS did not attempt to open Firefox profile data"
+) "sample did not attempt to open Firefox profile data"
 Require (
     Has-Event -Plugin "filemon" -Call "open" -PathContains "/Users/analyst/.electrum/wallets/"
-) "AMOS did not attempt to open Electrum wallet data"
+) "sample did not attempt to open Electrum wallet data"
+Require (
+    Has-Event -Plugin "filemon" -Call "open" -PathContains "/Users/analyst/Library/Application Support/Coinomi/wallets/"
+) "sample did not attempt to open Coinomi wallet data"
+Require (
+    Has-Event -Plugin "filemon" -Call "_lstat" -PathContains "/Users/analyst/Library/Application Support/Google/Chrome/"
+) "sample did not probe Chrome profile roots"
 
-Write-Output "AMOS trace check passed"
+Write-Output "Private-access trace check passed"

@@ -44,6 +44,124 @@ fn format_memory_value(value: i64, size: usize) -> String {
     format!("[{}]", rendered)
 }
 
+fn canonicalize_tagged_addr(addr: u64, pc: u64) -> Vec<u64> {
+    let low32 = addr & 0xFFFF_FFFF;
+    let pc_high = pc & 0xFFFF_FFFF_0000_0000;
+    let mut candidates = Vec::with_capacity(3);
+    candidates.push(low32);
+    if pc_high != 0 {
+        candidates.push(pc_high | low32);
+    }
+    candidates.push(0x1_0000_0000 | low32);
+    candidates.sort_unstable();
+    candidates.dedup();
+    candidates
+}
+
+fn arm64_mem_base_reg(instr: u32) -> Option<u8> {
+    let top = ((instr >> 24) & 0xFF) as u8;
+    match top {
+        0x28 | 0x29 | 0x68 | 0x69 | 0xA8 | 0xA9 | 0xE8 | 0xE9 | 0x38 | 0x39 | 0x78 | 0x79
+        | 0xB8 | 0xB9 | 0xF8 | 0xF9 => Some(((instr >> 5) & 0x1F) as u8),
+        _ => None,
+    }
+}
+
+fn arm64_reg_id(reg: u8) -> Option<i32> {
+    Some(match reg {
+        0 => RegisterARM64::X0 as i32,
+        1 => RegisterARM64::X1 as i32,
+        2 => RegisterARM64::X2 as i32,
+        3 => RegisterARM64::X3 as i32,
+        4 => RegisterARM64::X4 as i32,
+        5 => RegisterARM64::X5 as i32,
+        6 => RegisterARM64::X6 as i32,
+        7 => RegisterARM64::X7 as i32,
+        8 => RegisterARM64::X8 as i32,
+        9 => RegisterARM64::X9 as i32,
+        10 => RegisterARM64::X10 as i32,
+        11 => RegisterARM64::X11 as i32,
+        12 => RegisterARM64::X12 as i32,
+        13 => RegisterARM64::X13 as i32,
+        14 => RegisterARM64::X14 as i32,
+        15 => RegisterARM64::X15 as i32,
+        16 => RegisterARM64::X16 as i32,
+        17 => RegisterARM64::X17 as i32,
+        18 => RegisterARM64::X18 as i32,
+        19 => RegisterARM64::X19 as i32,
+        20 => RegisterARM64::X20 as i32,
+        21 => RegisterARM64::X21 as i32,
+        22 => RegisterARM64::X22 as i32,
+        23 => RegisterARM64::X23 as i32,
+        24 => RegisterARM64::X24 as i32,
+        25 => RegisterARM64::X25 as i32,
+        26 => RegisterARM64::X26 as i32,
+        27 => RegisterARM64::X27 as i32,
+        28 => RegisterARM64::X28 as i32,
+        29 => RegisterARM64::FP as i32,
+        30 => RegisterARM64::LR as i32,
+        31 => RegisterARM64::SP as i32,
+        _ => return None,
+    })
+}
+
+fn rewrite_tagged_mem_base<'a>(
+    uc: &mut Unicorn<'a, ()>,
+    instr: u32,
+    fault_addr: u64,
+    pc: u64,
+) -> Option<(u8, u64, u64)> {
+    if fault_addr < 0x1000 {
+        return None;
+    }
+    let reg = arm64_mem_base_reg(instr)?;
+    let reg_id = arm64_reg_id(reg)?;
+    let base = uc.reg_read(reg_id).ok()?;
+    for candidate in canonicalize_tagged_addr(fault_addr, pc) {
+        if uc.mem_read_as_vec(candidate, 1).is_err() {
+            continue;
+        }
+        let delta = fault_addr.wrapping_sub(base);
+        let rewritten = candidate.wrapping_sub(delta);
+        uc.reg_write(reg_id, rewritten).ok()?;
+        return Some((reg, base, rewritten));
+    }
+    None
+}
+
+fn map_tagged_alias_page<'a>(
+    uc: &mut Unicorn<'a, ()>,
+    fault_addr: u64,
+    pc: u64,
+) -> Option<(u64, u64)> {
+    if (fault_addr >> 48) == 0 {
+        return None;
+    }
+    let alias_page = fault_addr & !0xFFF;
+    let page_off = (fault_addr & 0xFFF) as usize;
+    for candidate in canonicalize_tagged_addr(fault_addr, pc) {
+        let source_page = candidate & !0xFFF;
+        let Ok(page) = uc.mem_read_as_vec(source_page, 0x1000) else {
+            continue;
+        };
+        if page_off >= page.len() {
+            continue;
+        }
+        if uc
+            .mem_map(alias_page, 0x1000, Prot::READ | Prot::WRITE | Prot::EXEC)
+            .is_err()
+            && uc.mem_read_as_vec(alias_page, 1).is_err()
+        {
+            continue;
+        }
+        if uc.mem_write(alias_page, &page).is_err() {
+            continue;
+        }
+        return Some((fault_addr, candidate));
+    }
+    None
+}
+
 pub struct UnicornEmulator {
     uc: Unicorn<'static, ()>,
     arch: ArchType,
@@ -81,10 +199,27 @@ impl UnicornEmulator {
             .map_err(|e| MacOsError::Unicorn(format!("Failed to map memory: {}", e)))
     }
 
+    pub fn map_memory_with_prot(
+        &mut self,
+        addr: u64,
+        size: u64,
+        prot: Prot,
+    ) -> Result<(), MacOsError> {
+        self.uc
+            .mem_map(addr, size, prot)
+            .map_err(|e| MacOsError::Unicorn(format!("Failed to map memory: {}", e)))
+    }
+
     pub fn map_data_memory(&mut self, addr: u64, size: u64) -> Result<(), MacOsError> {
         self.uc
             .mem_map(addr, size, Prot::READ | Prot::WRITE)
             .map_err(|e| MacOsError::Unicorn(format!("Failed to map memory: {}", e)))
+    }
+
+    pub fn protect_memory(&mut self, addr: u64, size: u64, prot: Prot) -> Result<(), MacOsError> {
+        self.uc
+            .mem_protect(addr, size, prot)
+            .map_err(|e| MacOsError::Unicorn(format!("Failed to protect memory: {}", e)))
     }
 
     pub fn reserve_lazy_data_memory(&mut self, addr: u64, size: u64) -> Result<(), MacOsError> {
@@ -347,6 +482,35 @@ impl UnicornEmulator {
                 };
                 let pc = uc.reg_read(pc_reg).unwrap_or(0);
                 let sp = uc.reg_read(sp_reg).unwrap_or(0);
+                let instr = uc
+                    .mem_read_as_vec(pc, 4)
+                    .ok()
+                    .and_then(|raw| <[u8; 4]>::try_from(raw.as_slice()).ok())
+                    .map(u32::from_le_bytes);
+                if let Some(instr) = instr {
+                    if let Some((reg, original, rewritten)) =
+                        rewrite_tagged_mem_base(uc, instr, addr, pc)
+                    {
+                        let event = arm64_memory_event("tagged-pointer-rewrite")
+                            .arg("FaultAddr", format!("0x{:X}", addr))
+                            .arg("Reg", format!("x{}", reg))
+                            .arg("Original", format!("0x{:X}", original))
+                            .arg("Rewritten", format!("0x{:X}", rewritten))
+                            .arg("Memtype", format!("{:?}", mem_type))
+                            .arg("pc", format!("0x{:X}", pc));
+                        emit_arm64_event(&trace_bus_for_memhook, event);
+                        return true;
+                    }
+                }
+                if let Some((fault_addr, candidate)) = map_tagged_alias_page(uc, addr, pc) {
+                    let event = arm64_memory_event("tagged-pointer-alias")
+                        .arg("FaultAddr", format!("0x{:X}", fault_addr))
+                        .arg("Candidate", format!("0x{:X}", candidate))
+                        .arg("Memtype", format!("{:?}", mem_type))
+                        .arg("pc", format!("0x{:X}", pc));
+                    emit_arm64_event(&trace_bus_for_memhook, event);
+                    return true;
+                }
                 let code = uc.mem_read_as_vec(pc, 8).unwrap_or_default();
                 let value_bytes = format_memory_value(value, size as usize);
                 let is_lazy_reserved_touch = {
