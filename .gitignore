@@ -21,7 +21,7 @@
 # Temporary build artifacts
 *.d
 *.o
-core
+/core
 
 # Local environments
 .env
