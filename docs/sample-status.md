@@ -48,12 +48,28 @@ emulator behavior.
   - uses chunked synthetic heap mapping so Rust runtime allocation churn no longer exhausts Unicorn memory sections
   - records `posix_spawnp` for `log stream --predicate ... restartInitiated/shutdownInitiated ... --info` and can feed synthetic matching log events into the redirected pipe
   - treats hidden `.inj_*` marker files as absent by default, so RustDoor does not falsely assume Chrome injection already happened
-  - progresses through the daemonization path (`fork`, `chdir`, `setsid`, second `fork`) and opens `/tmp/com.apple.lock`
-  - the immediate post-daemon blocker observed under the legacy 10M-instruction budget was `instruction_budget_exhausted` deep inside the parent's Rust `OnceLock`/init trampoline at the `cas64` → `blr` pattern around `0x100182424` / `0x10018242C`, well before the C2 / `posix_spawnp` command loop
-  - the default run profile now allocates 60 s / 50 M instructions, and `MACHINA_PROFILE=long` allocates 120 s / 200 M instructions, so post-daemon initialization should now complete inside a single emulation pass instead of being capped mid-`OnceLock`
+  - progresses through the daemonization path (`fork`, `chdir`, `setsid`, second `fork`) and the grandchild becomes the active daemon
+  - tagged-PC FETCH faults now redirect PC to the canonical address, so execution no longer accumulates additional tagged pages for each `bl`/`adrp` from a tagged page
+  - the daemon-singleton check on `/tmp/com.apple.lock` now reports `ENOENT`, so the freshly emulated daemon "wins" the lock instead of immediately exiting on the assumption another daemon is already present
+  - the LSE atomic hook now also handles `SWP[A][L]` and the rest of the `LDADD`/`LDCLR`/`LDEOR`/`LDSET`/`LDSMAX`/`LDSMIN`/`LDUMAX`/`LDUMIN` family, not just `CAS`/`LDADD`/`LDAPR`. The OnceLock release `SWPAL x8, x8, [x19]` at `0x10018242C` previously hung because Unicorn did not advance PC for it; with the explicit emulator that path now completes (transitioning `0x10026D450`/`0x10026D1D8` from `RUNNING` (2) to `COMPLETE` (3) so the init trampoline returns instead of looping).
+  - the synthetic `_waitpid` import now reports `ECHILD` for `WNOHANG` polls when no reapable child is left, mirroring `_wait4`. Without that, the post-OnceLock daemon spun forever in `waitpid(-1, &status, WNOHANG) == 0`.
+  - the `_exit` libc symbol is now hooked in addition to the BSD `__exit` syscall wrapper, so the daemon's clean shutdown actually terminates instead of falling through to the generic zero-return stub
+  - the `done_addr` cleanup hook now honors `stop_now` even when an `exited_pid` is also reported — the previous `else if` chain meant the runner kept running the dead caller's tail after the daemon exit
+  - off-canvas data pages (e.g. `0xA00000000`) are now synthesized for tagged data writes that fall outside the canonical heap/mmap arena, so the post-`waitpid` `WaitStatus` store at `[x19, #8]` (which packs an enum discriminant into bits 32–35) succeeds
+  - the parent process (`PID=1`, after the daemon detached) now reaches Chrome-injection probing:
+    - `_stat /Applications/Google Chrome.app/Contents/MacOS/Google Chrome` (Chrome detection)
+    - `_stat /Users/analyst/.docks/.inj_rc_chr` → `ENOENT` (Chrome rc-injection marker)
+    - `_stat /Users/analyst/.docks/.inj_launch_chr` → `ENOENT` (Chrome launch-injection marker)
+  - daemon child PID=3 now runs all the way through its persistence-and-Chrome-probing path and **terminates cleanly with `_exit(0)`** under the default profile:
+    - opens `~/.zshrc`, reads it in 32→2048-byte windows, then re-opens it `read_write` and writes injected lines for shell-startup persistence
+    - opens `~/.docks/cron` and `/tmp/com.apple.lock.<timestamp>` for cron-style and lock persistence
+    - `_stat`s the `~/.local` and `~/.zshrc` parents during persistence prep
+    - Stops with `Detail:"done_addr"` and `SawExit:true` (`Imports:10592`), no error
+  - the immediate post-daemon blocker observed under the legacy 10M-instruction budget was `instruction_budget_exhausted` deep inside the parent's Rust `OnceLock`/init trampoline at the `cas64` → `blr` pattern around `0x100182424` / `0x10018242C`; with the SWP/`_exit`/`done_addr` fixes that path now completes well within the default profile
 - Important implication:
-  - next compatibility work for this family should focus on what shows up *after* the post-daemon init completes: socket / `getaddrinfo` / SSL coverage for the C2 polling loop, and `posix_spawnp` argv routing for the eventual remote command execution
-  - lock-file lifecycle remains worth revisiting since the child PID currently `_close`s `/tmp/com.apple.lock` immediately rather than holding it across the command loop
+  - all of the in-process compatibility blockers (TLV bootstrap, LSE atomics including SWP, daemonization, lock-file singleton, parking_lot mutex/condvar, `waitpid` poll, `_exit`/`done_addr` dispatch, off-canvas tagged-pointer writes) are resolved
+  - what RustDoor doesn't do in-process is the actual remote command list (`curl`, `chflags hidden npm`, `zsh -c zip -r ...`, `mdfind -name .pem`, reverse-shell `back.sh`/`sh.sh`); per the Unit42 article those run later via the cron and `~/.zshrc` persistence we now write, not from the originally executed binary. Lock-file lifecycle is also worth revisiting — the daemon currently `_close`s `/tmp/com.apple.lock.<timestamp>` immediately rather than holding it across a long-running command loop.
+  - next compatibility work for this family should focus on simulating the second-stage execution paths (driving a fake shell login that re-reads `~/.zshrc`, executing the cron entry, or expanding socket/`getaddrinfo`/SSL coverage so a hypothetical command-loop variant could reach the C2) rather than coaxing more behavior out of the first-stage binary, which is now reaching `_exit(0)` cleanly
 - Recommended local invocation:
   - `MACHINA_PROFILE=long .\target\debug\machina.exe fixtures\macos\bin\rustdoor\76f96a35b6f638eed779dc127f29a5b537ffc3bb7accc2c9bfab5a2120ea6bc9.macho > rustdoor-trace-long.jsonl`
 

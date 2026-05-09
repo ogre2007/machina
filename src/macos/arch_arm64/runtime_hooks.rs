@@ -212,10 +212,23 @@ pub fn install_arm64_runtime_hooks(
                 }
                 if dispatched {
                     println!("[THREAD][arm64] done_addr dispatches pending synthetic thread");
-                } else if let Some(pid) = exited_pid {
-                    println!("[PROC][arm64] synthetic pid={} reached done_addr and exited", pid);
-                } else if stop_now {
-                    let _ = emu.stop_emulation();
+                } else {
+                    if let Some(pid) = exited_pid {
+                        println!(
+                            "[PROC][arm64] synthetic pid={} reached done_addr and exited",
+                            pid
+                        );
+                    }
+                    if stop_now {
+                        // Honor the requested stop even when we also marked
+                        // a synthetic process as exited. The previous
+                        // `else if` chain meant `exited_pid` shadowed
+                        // `stop_now`, leaving the runner to keep executing
+                        // the dead caller's tail (in RustDoor: a runaway
+                        // `waitpid`/`__error` poll after the daemon's
+                        // `_exit`).
+                        let _ = emu.stop_emulation();
+                    }
                 }
                 let current_tid = thread_runtime
                     .lock()

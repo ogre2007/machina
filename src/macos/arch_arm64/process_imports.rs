@@ -492,7 +492,12 @@ pub fn install_arm64_process_imports(
         )?;
     }
 
-    if let Some(&addr) = stub_map.get("_wait4") {
+    for (sym, call_label, has_rusage) in
+        [("_wait4", "wait4", true), ("_waitpid", "waitpid", false)]
+    {
+        let Some(&addr) = stub_map.get(sym) else {
+            continue;
+        };
         let os_runtime = shared_state.os_runtime.clone();
         let thread_runtime = shared_state.thread_runtime.clone();
         let import_tracker = import_tracker.clone();
@@ -504,7 +509,11 @@ pub fn install_arm64_process_imports(
                 let pid_arg = emu.read_reg("x0").unwrap_or(0);
                 let status_ptr = emu.read_reg("x1").unwrap_or(0);
                 let options = emu.read_reg("x2").unwrap_or(0);
-                let rusage_ptr = emu.read_reg("x3").unwrap_or(0);
+                let rusage_ptr = if has_rusage {
+                    emu.read_reg("x3").unwrap_or(0)
+                } else {
+                    0
+                };
                 let current_tid = thread_runtime
                     .lock()
                     .ok()
@@ -515,6 +524,12 @@ pub fn install_arm64_process_imports(
                     .ok()
                     .and_then(|os| os.thread_processes.get(&current_tid).copied())
                     .unwrap_or(1);
+                // WNOHANG (option bit 1) means the caller is polling. Once
+                // we've delivered the synthetic exit for a child the caller
+                // typically loops again expecting -1/ECHILD; otherwise the
+                // RustDoor daemon (and many shells) spin in a tight WNOHANG
+                // poll burning the entire instruction budget.
+                let wnohang = options & 1 != 0;
                 let (result, status_value, errno) = {
                     let mut os = match os_runtime.lock() {
                         Ok(os) => os,
@@ -539,9 +554,12 @@ pub fn install_arm64_process_imports(
                                 && (pid_arg == 0 || *pid == pid_arg)
                                 && !proc_state.reaped
                         });
-                        if has_child {
+                        if has_child && !wnohang {
                             (0u64, 0u32, 0u32)
                         } else {
+                            // Either no children or WNOHANG with no
+                            // dead child to reap. Report ECHILD so
+                            // poll loops can advance instead of spinning.
                             (u64::MAX, 0u32, 10u32)
                         }
                     }
@@ -561,21 +579,20 @@ pub fn install_arm64_process_imports(
                 record_arm64_import(
                     &import_tracker,
                     format!(
-                        "_wait4(pid={}, status=0x{:X}, options=0x{:X}) -> pid={} status=0x{:X} errno={}",
-                        pid_arg, status_ptr, options, result, status_value, errno
+                        "{sym}(pid={pid_arg}, status=0x{status_ptr:X}, options=0x{options:X}) -> pid={result} status=0x{status_value:X} errno={errno}"
                     ),
                 );
                 println!(
-                    "[PROC][arm64] _wait4 pid={} status=0x{:X} options=0x{:X} rusage=0x{:X} current_pid={} -> pid={} status=0x{:X} errno={}",
-                    pid_arg, status_ptr, options, rusage_ptr, current_pid, result, status_value, errno
+                    "[PROC][arm64] {sym} pid={pid_arg} status=0x{status_ptr:X} options=0x{options:X} rusage=0x{rusage_ptr:X} current_pid={current_pid} -> pid={result} status=0x{status_value:X} errno={errno}"
                 );
-                let event = arm64_process_event(current_pid, current_tid, "wait4", "wait4")
+                let event = arm64_process_event(current_pid, current_tid, call_label, call_label)
                     .arg("TargetPid", pid_arg.to_string())
                     .arg("ResultPid", result.to_string())
                     .arg("StatusPtr", format!("0x{:X}", status_ptr))
                     .arg("StatusValue", status_value.to_string())
                     .arg("Options", format!("0x{:X}", options))
                     .arg("RusagePtr", format!("0x{:X}", rusage_ptr))
+                    .arg("Wnohang", wnohang.to_string())
                     .arg("Errno", errno.to_string());
                 emit_arm64_event(&trace_bus_for_hook, event);
             },
@@ -736,7 +753,17 @@ pub fn install_arm64_process_imports(
         )?;
     }
 
-    if let Some(&addr) = stub_map.get("__exit") {
+    // Hook both `__exit` (the BSD `_exit(2)` syscall wrapper, symbol prefix
+    // `_` + name `_exit`) and `_exit` (the C library `exit(3)` that runs
+    // atexit handlers and tail-calls `_exit(2)`, symbol prefix `_` + name
+    // `exit`). Without an `_exit` hook the post-fork parent in RustDoor
+    // never terminates and instead falls through into a `waitpid`-WNOHANG
+    // poll loop that consumes the entire timeout budget without ever
+    // reaching the actual command-execution stage.
+    for sym in ["__exit", "_exit"] {
+        let Some(&addr) = stub_map.get(sym) else {
+            continue;
+        };
         let os_runtime = shared_state.os_runtime.clone();
         let thread_runtime = shared_state.thread_runtime.clone();
         let import_tracker = import_tracker.clone();
@@ -843,22 +870,32 @@ pub fn install_arm64_process_imports(
                         .unwrap_or(false)
                     {
                         runtime.active_thread.take();
-                        if let Ok(did_dispatch) = dispatch_pending_arm64_thread(emu, &mut runtime) {
+                        if let Ok(did_dispatch) =
+                            dispatch_pending_arm64_thread(emu, &mut runtime)
+                        {
                             dispatched = did_dispatch;
                         }
                     }
                 }
-                if !dispatched && lr != 0 {
-                    let _ = emu.write_reg("pc", lr);
+                if !dispatched {
+                    // The exiting thread was the last live thread we can
+                    // schedule. The pre-existing behavior fell through to
+                    // `pc = lr`, which left the now-dead caller's
+                    // instructions as the active execution path — for the
+                    // RustDoor daemon that meant a runaway
+                    // `waitpid`/`__error` poll loop after `_exit` consumed
+                    // the entire timeout budget. Park PC at done_addr so
+                    // the runner stops cleanly with a real `post_exit`
+                    // status instead of executing the dead caller's tail.
+                    let _ = emu.write_reg("pc", done_addr);
                 }
                 record_arm64_import(
                     &import_tracker,
                     format!(
-                        "__exit(code={}, pid={}, tid={}, lr=0x{:X}, caller=0x{:X})",
-                        code, current_pid, current_tid, lr, caller_lr
+                        "{sym}(code={code}, pid={current_pid}, tid={current_tid}, lr=0x{lr:X}, caller=0x{caller_lr:X})"
                     ),
                 );
-                let event = arm64_process_event(current_pid, current_tid, "exit", "__exit")
+                let event = arm64_process_event(current_pid, current_tid, "exit", sym)
                     .arg("Code", code.to_string())
                     .arg("HasOtherThreads", has_other_threads.to_string())
                     .arg("Dispatched", dispatched.to_string())
