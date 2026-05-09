@@ -160,7 +160,30 @@ pub fn install_arm64_pthread_imports(
                             addr
                         };
                         let _ = emu.map_data_memory(addr, 0x1000);
-                        let _ = emu.write_memory(addr, &[0u8; 16]);
+                        // Seed the new thread-local slot with whatever the
+                        // main thread (tid=1) already has for the same
+                        // descriptor. Rust thread-locals on real macOS are
+                        // initialized from the binary's __thread_data
+                        // template; since we don't read that template we
+                        // fall back to the main thread's already-bootstrapped
+                        // page so worker pthreads inherit non-zero defaults
+                        // (e.g. the random-state slot the daemon's main
+                        // thread populated via getentropy). Without this,
+                        // the worker reads all zeros and Rust's "non-zero
+                        // sentinel" thread-local invariants trip the
+                        // panic-helper at 0x10000AE00.
+                        let mut seed = [0u8; 0x1000];
+                        if thread_id != 1 {
+                            if let Some(&main_addr) =
+                                storage.get(&(1, descriptor))
+                            {
+                                if let Ok(bytes) = emu.read_memory(main_addr, 0x1000) {
+                                    let len = bytes.len().min(seed.len());
+                                    seed[..len].copy_from_slice(&bytes[..len]);
+                                }
+                            }
+                        }
+                        let _ = emu.write_memory(addr, &seed);
                         storage.insert((thread_id, descriptor), addr);
                         addr
                     }
