@@ -55,10 +55,16 @@ emulator behavior.
     - opens `~/.zshrc` (read-only then read-write) for shell-startup persistence injection
     - opens `~/.docks/cron` for cron-style persistence
     - creates `/tmp/com.apple.lock.<timestamp>` IPC/marker files
-  - currently stops in a Rust-runtime atomic spin (parking_lot-style mutex CAS at `0x100182000-0x100182500`) before the C2 command list (curl, zip, mdfind, reverse shell) is reached
+  - the LSE atomic hook now also handles `SWP[A][L]` and the rest of the `LDADD`/`LDCLR`/`LDEOR`/`LDSET`/`LDSMAX`/`LDSMIN`/`LDUMAX`/`LDUMIN` family, not just `CAS`/`LDADD`/`LDAPR`. The OnceLock release `SWPAL x8, x8, [x19]` at `0x10018242C` previously hung because Unicorn did not advance PC for it; with the explicit emulator that path now completes.
+  - the synthetic `_waitpid` import now reports `ECHILD` for `WNOHANG` polls when no reapable child is left, mirroring `_wait4`. Without that, the post-OnceLock daemon spun forever in `waitpid(-1, &status, WNOHANG) == 0`.
+  - the parent process (`PID=1`, after the daemon detached) now reaches Chrome-injection probing:
+    - `_stat /Applications/Google Chrome.app/Contents/MacOS/Google Chrome` (Chrome detection)
+    - `_stat /Users/analyst/.docks/.inj_rc_chr` → `ENOENT` (Chrome rc-injection marker)
+    - `_stat /Users/analyst/.docks/.inj_launch_chr` → `ENOENT` (Chrome launch-injection marker)
+  - currently stops with `WRITE_UNMAPPED` to a tagged pointer (`x0=0xA00000002`, tag `0xA`) downstream of the second `_waitpid`/`__error` poll, before the Chrome injection actually runs. The tagged data-write fault is not yet handled by the alias-page mapper.
 - Important implication:
-  - the main blocker has moved from daemon-singleton/lock-file semantics into a tight Rust runtime atomic loop downstream of persistence setup
-  - next compatibility work for this family should fast-forward or short-circuit the parking_lot-style mutex/condvar spin so RustDoor reaches the curl/zsh command exec path
+  - the main blocker has moved from the daemon's parking_lot-style atomic loop into a tagged-pointer data-write fault during Chrome injection bookkeeping
+  - next compatibility work should extend the tagged-pointer alias mapper to write-side faults that synthesize a writable canonical-aliased page, then verify whether the parent reaches the actual `posix_spawnp` of `osascript` / `chflags hidden npm` / `curl` / `zsh -c zip -r ...` commands
 
 ## Corpus hygiene
 

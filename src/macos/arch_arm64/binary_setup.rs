@@ -246,7 +246,12 @@ pub fn install_arm64_lse_atomic_hooks(
     let mut installed = 0u64;
     for (index, chunk) in bytes.chunks_exact(4).enumerate() {
         let word = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-        if !is_arm64_lse_cas(word) && !is_arm64_lse_ldadd(word) && !is_arm64_ldapr(word) {
+        if !is_arm64_lse_cas(word)
+            && !is_arm64_lse_ldadd(word)
+            && !is_arm64_lse_atomic_op(word)
+            && !is_arm64_lse_swp(word)
+            && !is_arm64_ldapr(word)
+        {
             continue;
         }
         let hook_addr = text.addr + (index as u64 * 4);
@@ -265,8 +270,12 @@ pub fn install_arm64_lse_atomic_hooks(
                 let instr = u32::from_le_bytes(raw4);
                 let event = if is_arm64_lse_cas(instr) {
                     emulate_arm64_lse_cas(emu, instr)
+                } else if is_arm64_lse_swp(instr) {
+                    emulate_arm64_lse_swp(emu, instr)
                 } else if is_arm64_lse_ldadd(instr) {
                     emulate_arm64_lse_ldadd(emu, instr)
+                } else if is_arm64_lse_atomic_op(instr) {
+                    emulate_arm64_lse_atomic_op(emu, instr)
                 } else if is_arm64_ldapr(instr) {
                     emulate_arm64_ldapr(emu, instr)
                 } else {
@@ -513,6 +522,23 @@ fn is_arm64_lse_ldadd(instr: u32) -> bool {
     (instr & 0x3F20_F000) == 0x3820_0000
 }
 
+fn is_arm64_lse_atomic_op(instr: u32) -> bool {
+    // ARMv8.1 LSE atomic memory operations: LDADD, LDCLR, LDEOR, LDSET,
+    // LDSMAX, LDSMIN, LDUMAX, LDUMIN (and their A/L acquire/release
+    // variants). The opc field at bits 14..12 selects the operation;
+    // bit 15 must be 0 (1 means SWP) and bits 11..10 must be 00.
+    (instr & 0x3F20_8C00) == 0x3820_0000
+}
+
+fn is_arm64_lse_swp(instr: u32) -> bool {
+    // ARMv8.1 LSE SWP[A][L]. Same prefix as the other LSE atomic memory ops
+    // but with bit 15 set and the opc field in bits 14..12 zero. Without an
+    // explicit hook, some Unicorn builds fail to advance PC for SWP, so
+    // RustDoor's parking_lot-style OnceLock release at `0x10018242C` would
+    // hang and burn the entire instruction budget on a single SWPAL.
+    (instr & 0x3F20_FC00) == 0x3820_8000
+}
+
 fn is_arm64_ldapr(instr: u32) -> bool {
     // LDAPR is an acquire load used by modern arm64 runtime code. Some Unicorn
     // builds do not advance it correctly, so emulate it as a plain load plus pc.
@@ -685,6 +711,178 @@ fn emulate_arm64_lse_ldadd(
         ("Acquire", acquire.to_string()),
         ("Release", release.to_string()),
         ("Addend", format!("0x{:X}", addend)),
+        ("OldValue", format!("0x{:X}", old_value)),
+        ("NewValue", format!("0x{:X}", new_value)),
+        ("Rs", rs.to_string()),
+        ("Rt", rt.to_string()),
+        ("Rn", rn.to_string()),
+        ("Encoding", format!("0x{:08X}", instr)),
+    ])
+}
+
+fn emulate_arm64_lse_swp(
+    emu: &mut machina::UnicornEmulator,
+    instr: u32,
+) -> Option<Vec<(&'static str, String)>> {
+    let is_64 = ((instr >> 30) & 1) != 0;
+    let acquire = ((instr >> 23) & 1) != 0;
+    let release = ((instr >> 22) & 1) != 0;
+    let rs = ((instr >> 16) & 0x1F) as u8;
+    let rn = ((instr >> 5) & 0x1F) as u8;
+    let rt = (instr & 0x1F) as u8;
+    let addr = if rn == 31 {
+        emu.read_reg("sp").ok()?
+    } else {
+        emu.read_reg(&format!("x{}", rn)).ok()?
+    };
+    let new_value = read_arm64_gpr(emu, rs, is_64)?;
+    let old_value = if is_64 {
+        let bytes = emu.read_memory(addr, 8).ok()?;
+        u64::from_le_bytes(<[u8; 8]>::try_from(bytes.as_slice()).ok()?)
+    } else {
+        let bytes = emu.read_memory(addr, 4).ok()?;
+        u32::from_le_bytes(<[u8; 4]>::try_from(bytes.as_slice()).ok()?) as u64
+    };
+    if is_64 {
+        let _ = emu.write_memory(addr, &new_value.to_le_bytes());
+    } else {
+        let _ = emu.write_memory(addr, &(new_value as u32).to_le_bytes());
+    }
+    write_arm64_gpr(emu, rt, old_value, is_64)?;
+    let pc = emu.read_reg("pc").ok()?;
+    let _ = emu.write_reg("pc", pc.saturating_add(4));
+
+    Some(vec![
+        ("Pc", format!("0x{:X}", pc)),
+        ("Address", format!("0x{:X}", addr)),
+        ("Kind", if is_64 { "swp64" } else { "swp32" }.to_string()),
+        ("Acquire", acquire.to_string()),
+        ("Release", release.to_string()),
+        ("NewValue", format!("0x{:X}", new_value)),
+        ("OldValue", format!("0x{:X}", old_value)),
+        ("Rs", rs.to_string()),
+        ("Rt", rt.to_string()),
+        ("Rn", rn.to_string()),
+        ("Encoding", format!("0x{:08X}", instr)),
+    ])
+}
+
+fn emulate_arm64_lse_atomic_op(
+    emu: &mut machina::UnicornEmulator,
+    instr: u32,
+) -> Option<Vec<(&'static str, String)>> {
+    let is_64 = ((instr >> 30) & 1) != 0;
+    let acquire = ((instr >> 23) & 1) != 0;
+    let release = ((instr >> 22) & 1) != 0;
+    let rs = ((instr >> 16) & 0x1F) as u8;
+    let opc = ((instr >> 12) & 0x7) as u8;
+    let rn = ((instr >> 5) & 0x1F) as u8;
+    let rt = (instr & 0x1F) as u8;
+    let addr = if rn == 31 {
+        emu.read_reg("sp").ok()?
+    } else {
+        emu.read_reg(&format!("x{}", rn)).ok()?
+    };
+    let operand = read_arm64_gpr(emu, rs, is_64)?;
+    let old_value = if is_64 {
+        let bytes = emu.read_memory(addr, 8).ok()?;
+        u64::from_le_bytes(<[u8; 8]>::try_from(bytes.as_slice()).ok()?)
+    } else {
+        let bytes = emu.read_memory(addr, 4).ok()?;
+        u32::from_le_bytes(<[u8; 4]>::try_from(bytes.as_slice()).ok()?) as u64
+    };
+    let kind: &'static str;
+    let new_value = if is_64 {
+        match opc {
+            0b000 => {
+                kind = "ldadd64";
+                old_value.wrapping_add(operand)
+            }
+            0b001 => {
+                kind = "ldclr64";
+                old_value & !operand
+            }
+            0b010 => {
+                kind = "ldeor64";
+                old_value ^ operand
+            }
+            0b011 => {
+                kind = "ldset64";
+                old_value | operand
+            }
+            0b100 => {
+                kind = "ldsmax64";
+                core::cmp::max(old_value as i64, operand as i64) as u64
+            }
+            0b101 => {
+                kind = "ldsmin64";
+                core::cmp::min(old_value as i64, operand as i64) as u64
+            }
+            0b110 => {
+                kind = "ldumax64";
+                core::cmp::max(old_value, operand)
+            }
+            0b111 => {
+                kind = "ldumin64";
+                core::cmp::min(old_value, operand)
+            }
+            _ => return None,
+        }
+    } else {
+        let lhs = old_value as u32;
+        let rhs = operand as u32;
+        match opc {
+            0b000 => {
+                kind = "ldadd32";
+                lhs.wrapping_add(rhs) as u64
+            }
+            0b001 => {
+                kind = "ldclr32";
+                (lhs & !rhs) as u64
+            }
+            0b010 => {
+                kind = "ldeor32";
+                (lhs ^ rhs) as u64
+            }
+            0b011 => {
+                kind = "ldset32";
+                (lhs | rhs) as u64
+            }
+            0b100 => {
+                kind = "ldsmax32";
+                core::cmp::max(lhs as i32, rhs as i32) as u32 as u64
+            }
+            0b101 => {
+                kind = "ldsmin32";
+                core::cmp::min(lhs as i32, rhs as i32) as u32 as u64
+            }
+            0b110 => {
+                kind = "ldumax32";
+                core::cmp::max(lhs, rhs) as u64
+            }
+            0b111 => {
+                kind = "ldumin32";
+                core::cmp::min(lhs, rhs) as u64
+            }
+            _ => return None,
+        }
+    };
+    if is_64 {
+        let _ = emu.write_memory(addr, &new_value.to_le_bytes());
+    } else {
+        let _ = emu.write_memory(addr, &(new_value as u32).to_le_bytes());
+    }
+    write_arm64_gpr(emu, rt, old_value, is_64)?;
+    let pc = emu.read_reg("pc").ok()?;
+    let _ = emu.write_reg("pc", pc.saturating_add(4));
+
+    Some(vec![
+        ("Pc", format!("0x{:X}", pc)),
+        ("Address", format!("0x{:X}", addr)),
+        ("Kind", kind.to_string()),
+        ("Acquire", acquire.to_string()),
+        ("Release", release.to_string()),
+        ("Operand", format!("0x{:X}", operand)),
         ("OldValue", format!("0x{:X}", old_value)),
         ("NewValue", format!("0x{:X}", new_value)),
         ("Rs", rs.to_string()),

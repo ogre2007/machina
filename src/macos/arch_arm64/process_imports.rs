@@ -492,7 +492,12 @@ pub fn install_arm64_process_imports(
         )?;
     }
 
-    if let Some(&addr) = stub_map.get("_wait4") {
+    for (sym, call_label, has_rusage) in
+        [("_wait4", "wait4", true), ("_waitpid", "waitpid", false)]
+    {
+        let Some(&addr) = stub_map.get(sym) else {
+            continue;
+        };
         let os_runtime = shared_state.os_runtime.clone();
         let thread_runtime = shared_state.thread_runtime.clone();
         let import_tracker = import_tracker.clone();
@@ -504,7 +509,11 @@ pub fn install_arm64_process_imports(
                 let pid_arg = emu.read_reg("x0").unwrap_or(0);
                 let status_ptr = emu.read_reg("x1").unwrap_or(0);
                 let options = emu.read_reg("x2").unwrap_or(0);
-                let rusage_ptr = emu.read_reg("x3").unwrap_or(0);
+                let rusage_ptr = if has_rusage {
+                    emu.read_reg("x3").unwrap_or(0)
+                } else {
+                    0
+                };
                 let current_tid = thread_runtime
                     .lock()
                     .ok()
@@ -515,6 +524,12 @@ pub fn install_arm64_process_imports(
                     .ok()
                     .and_then(|os| os.thread_processes.get(&current_tid).copied())
                     .unwrap_or(1);
+                // WNOHANG (option bit 1) means the caller is polling. Once
+                // we've delivered the synthetic exit for a child the caller
+                // typically loops again expecting -1/ECHILD; otherwise the
+                // RustDoor daemon (and many shells) spin in a tight WNOHANG
+                // poll burning the entire instruction budget.
+                let wnohang = options & 1 != 0;
                 let (result, status_value, errno) = {
                     let mut os = match os_runtime.lock() {
                         Ok(os) => os,
@@ -539,9 +554,12 @@ pub fn install_arm64_process_imports(
                                 && (pid_arg == 0 || *pid == pid_arg)
                                 && !proc_state.reaped
                         });
-                        if has_child {
+                        if has_child && !wnohang {
                             (0u64, 0u32, 0u32)
                         } else {
+                            // Either no children or WNOHANG with no
+                            // dead child to reap. Report ECHILD so
+                            // poll loops can advance instead of spinning.
                             (u64::MAX, 0u32, 10u32)
                         }
                     }
@@ -561,21 +579,20 @@ pub fn install_arm64_process_imports(
                 record_arm64_import(
                     &import_tracker,
                     format!(
-                        "_wait4(pid={}, status=0x{:X}, options=0x{:X}) -> pid={} status=0x{:X} errno={}",
-                        pid_arg, status_ptr, options, result, status_value, errno
+                        "{sym}(pid={pid_arg}, status=0x{status_ptr:X}, options=0x{options:X}) -> pid={result} status=0x{status_value:X} errno={errno}"
                     ),
                 );
                 println!(
-                    "[PROC][arm64] _wait4 pid={} status=0x{:X} options=0x{:X} rusage=0x{:X} current_pid={} -> pid={} status=0x{:X} errno={}",
-                    pid_arg, status_ptr, options, rusage_ptr, current_pid, result, status_value, errno
+                    "[PROC][arm64] {sym} pid={pid_arg} status=0x{status_ptr:X} options=0x{options:X} rusage=0x{rusage_ptr:X} current_pid={current_pid} -> pid={result} status=0x{status_value:X} errno={errno}"
                 );
-                let event = arm64_process_event(current_pid, current_tid, "wait4", "wait4")
+                let event = arm64_process_event(current_pid, current_tid, call_label, call_label)
                     .arg("TargetPid", pid_arg.to_string())
                     .arg("ResultPid", result.to_string())
                     .arg("StatusPtr", format!("0x{:X}", status_ptr))
                     .arg("StatusValue", status_value.to_string())
                     .arg("Options", format!("0x{:X}", options))
                     .arg("RusagePtr", format!("0x{:X}", rusage_ptr))
+                    .arg("Wnohang", wnohang.to_string())
                     .arg("Errno", errno.to_string());
                 emit_arm64_event(&trace_bus_for_hook, event);
             },
