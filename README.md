@@ -45,6 +45,11 @@ Useful knobs:
 - `MACHINA_TRACE_FORMAT=human`: legacy human-readable sink for debugging
 - `MACHINA_INDIRECT_BRANCH_MODE=fast`: default; skip expensive indirect-branch sanitizers
 - `MACHINA_INDIRECT_BRANCH_MODE=sanitize`: enable indirect-branch sanitizers for debugging signed or tagged branch targets
+- `MACHINA_PROFILE=default`: default; 60s timeout, 50M instruction budget (suitable for most samples and CI)
+- `MACHINA_PROFILE=short`: legacy 15s / 10M-instruction budget (for tight smoke runs)
+- `MACHINA_PROFILE=long`: 120s / 200M-instruction budget (recommended for RustDoor and other Rust binaries with large startup graphs)
+- `MACHINA_PROFILE=extended`: 300s / 1B-instruction budget (deep analysis runs)
+- `MACHINA_TIMEOUT_USECS` / `MACHINA_MAX_INSTRUCTIONS`: explicit overrides; always win over the active profile
 
 ## Build
 

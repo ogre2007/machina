@@ -49,10 +49,13 @@ emulator behavior.
   - records `posix_spawnp` for `log stream --predicate ... restartInitiated/shutdownInitiated ... --info` and can feed synthetic matching log events into the redirected pipe
   - treats hidden `.inj_*` marker files as absent by default, so RustDoor does not falsely assume Chrome injection already happened
   - progresses through the daemonization path (`fork`, `chdir`, `setsid`, second `fork`) and opens `/tmp/com.apple.lock`
-  - currently stops after daemon/lock setup rather than reaching the later remote command execution commands listed in the local analysis article
+  - the immediate post-daemon blocker observed under the legacy 10M-instruction budget was `instruction_budget_exhausted` deep inside the parent's Rust `OnceLock`/init trampoline at the `cas64` → `blr` pattern around `0x100182424` / `0x10018242C`, well before the C2 / `posix_spawnp` command loop
+  - the default run profile now allocates 60 s / 50 M instructions, and `MACHINA_PROFILE=long` allocates 120 s / 200 M instructions, so post-daemon initialization should now complete inside a single emulation pass instead of being capped mid-`OnceLock`
 - Important implication:
-  - the main blocker has moved from import coverage, LSE atomics, heap mapping, and long-running `log stream` output into daemon lifecycle and lock-file semantics
-  - next compatibility work for this family should focus on parent/child process lifecycle after daemonization and whether lock-file creation should keep the child active for the later command loop
+  - next compatibility work for this family should focus on what shows up *after* the post-daemon init completes: socket / `getaddrinfo` / SSL coverage for the C2 polling loop, and `posix_spawnp` argv routing for the eventual remote command execution
+  - lock-file lifecycle remains worth revisiting since the child PID currently `_close`s `/tmp/com.apple.lock` immediately rather than holding it across the command loop
+- Recommended local invocation:
+  - `MACHINA_PROFILE=long .\target\debug\machina.exe fixtures\macos\bin\rustdoor\76f96a35b6f638eed779dc127f29a5b537ffc3bb7accc2c9bfab5a2120ea6bc9.macho > rustdoor-trace-long.jsonl`
 
 ## Corpus hygiene
 

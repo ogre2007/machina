@@ -48,6 +48,39 @@ fn env_hex_u64(name: &str) -> Option<u64> {
     u64::from_str_radix(hex, 16).ok()
 }
 
+/// Resolve the canonical instruction/time budget for the active run profile.
+///
+/// Returns `(profile_label, timeout_usecs_default, instruction_count_default)`.
+///
+/// Real-world macOS Mach-O samples (especially Rust binaries with large
+/// `OnceLock`/TLS initialization graphs like RustDoor) routinely need more
+/// than the original 10M-instruction budget just to finish startup, well
+/// before reaching the malware-interesting C2 / spawn / file logic. The
+/// `MACHINA_PROFILE` knob lets analysts opt into longer budgets without
+/// having to set every limit env var by hand.
+///
+/// Recognized values (case-insensitive, leading/trailing whitespace ignored):
+///
+/// - `default` / unset / empty → 60 s, 50_000_000 instructions
+/// - `short`                   → 15 s, 10_000_000 instructions  (legacy cap)
+/// - `long`                    → 120 s, 200_000_000 instructions
+/// - `extended`                → 300 s, 1_000_000_000 instructions
+///
+/// Explicit `MACHINA_TIMEOUT_USECS` / `MACHINA_MAX_INSTRUCTIONS` always win.
+fn resolve_run_profile() -> (&'static str, u64, usize) {
+    let raw = std::env::var("MACHINA_PROFILE").ok();
+    let label: String = raw
+        .as_deref()
+        .map(|v| v.trim().to_ascii_lowercase())
+        .unwrap_or_default();
+    match label.as_str() {
+        "short" | "legacy" | "compat" => ("short", 15_000_000, 10_000_000),
+        "long" | "rustdoor" => ("long", 120_000_000, 200_000_000),
+        "extended" | "deep" => ("extended", 300_000_000, 1_000_000_000),
+        _ => ("default", 60_000_000, 50_000_000),
+    }
+}
+
 fn env_bool(name: &str) -> bool {
     std::env::var(name)
         .ok()
@@ -344,8 +377,17 @@ pub fn run_arm64_with_diagnostics(
         emit_runner_trace_event(&report.trace_bus, &metadata, event);
     };
 
-    let timeout_usecs = env_u64("MACHINA_TIMEOUT_USECS", 15_000_000);
-    let instruction_count = env_usize("MACHINA_MAX_INSTRUCTIONS", 10_000_000);
+    let (profile_name, profile_timeout, profile_instructions) = resolve_run_profile();
+    let timeout_usecs = env_u64("MACHINA_TIMEOUT_USECS", profile_timeout);
+    let instruction_count = env_usize("MACHINA_MAX_INSTRUCTIONS", profile_instructions);
+    {
+        let metadata = runtime_process_metadata(report.process_name.clone());
+        let event = process_event(&metadata, "run-profile", "run-profile")
+            .arg("Profile", profile_name)
+            .arg("TimeoutUsecs", timeout_usecs.to_string())
+            .arg("MaxInstructions", instruction_count.to_string());
+        emit_runner_trace_event(&report.trace_bus, &metadata, event);
+    }
     let start = Instant::now();
     match emulator.run_with_limits(report.actual_entry, None, timeout_usecs, instruction_count) {
         Ok(()) => {
