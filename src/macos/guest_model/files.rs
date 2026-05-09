@@ -237,7 +237,18 @@ fn should_materialize_missing_path(raw_path: &str) -> bool {
     else {
         return true;
     };
-    !name.starts_with(".inj_")
+    if name.starts_with(".inj_") {
+        return false;
+    }
+    // RustDoor opens /tmp/com.apple.lock as a daemon-singleton check —
+    // if it exists the new instance assumes another daemon is already
+    // running and exits before reaching the C2 command loop. Treat the
+    // file as absent so the freshly-emulated daemon "wins" the lock and
+    // proceeds into the interesting commands.
+    if raw_path == "/tmp/com.apple.lock" {
+        return false;
+    }
+    true
 }
 
 fn synthesize_missing_open_target(
@@ -488,5 +499,11 @@ mod tests {
             stat_guest_path(&table, "/Users/analyst/.docks/.inj_launch_chr"),
             Err(2)
         );
+    }
+
+    #[test]
+    fn stat_does_not_materialize_rustdoor_singleton_lock() {
+        let table = table();
+        assert_eq!(stat_guest_path(&table, "/tmp/com.apple.lock"), Err(2));
     }
 }

@@ -48,11 +48,17 @@ emulator behavior.
   - uses chunked synthetic heap mapping so Rust runtime allocation churn no longer exhausts Unicorn memory sections
   - records `posix_spawnp` for `log stream --predicate ... restartInitiated/shutdownInitiated ... --info` and can feed synthetic matching log events into the redirected pipe
   - treats hidden `.inj_*` marker files as absent by default, so RustDoor does not falsely assume Chrome injection already happened
-  - progresses through the daemonization path (`fork`, `chdir`, `setsid`, second `fork`) and opens `/tmp/com.apple.lock`
-  - currently stops after daemon/lock setup rather than reaching the later remote command execution commands listed in the local analysis article
+  - progresses through the daemonization path (`fork`, `chdir`, `setsid`, second `fork`) and the grandchild becomes the active daemon
+  - tagged-PC FETCH faults now redirect PC to the canonical address, so execution no longer accumulates additional tagged pages for each `bl`/`adrp` from a tagged page
+  - the daemon-singleton check on `/tmp/com.apple.lock` now reports `ENOENT`, so the freshly emulated daemon "wins" the lock instead of immediately exiting on the assumption another daemon is already present
+  - daemon child PID=3 now reaches persistence/setup activity:
+    - opens `~/.zshrc` (read-only then read-write) for shell-startup persistence injection
+    - opens `~/.docks/cron` for cron-style persistence
+    - creates `/tmp/com.apple.lock.<timestamp>` IPC/marker files
+  - currently stops in a Rust-runtime atomic spin (parking_lot-style mutex CAS at `0x100182000-0x100182500`) before the C2 command list (curl, zip, mdfind, reverse shell) is reached
 - Important implication:
-  - the main blocker has moved from import coverage, LSE atomics, heap mapping, and long-running `log stream` output into daemon lifecycle and lock-file semantics
-  - next compatibility work for this family should focus on parent/child process lifecycle after daemonization and whether lock-file creation should keep the child active for the later command loop
+  - the main blocker has moved from daemon-singleton/lock-file semantics into a tight Rust runtime atomic loop downstream of persistence setup
+  - next compatibility work for this family should fast-forward or short-circuit the parking_lot-style mutex/condvar spin so RustDoor reaches the curl/zsh command exec path
 
 ## Corpus hygiene
 

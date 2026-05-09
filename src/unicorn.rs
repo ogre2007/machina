@@ -162,6 +162,28 @@ fn map_tagged_alias_page<'a>(
     None
 }
 
+/// After mapping a copy of a canonical page at the tagged PC alias, also
+/// redirect PC to the canonical address. Without this, instructions in the
+/// alias page execute with PC-relative addressing producing more tagged
+/// faults for every `bl`, `b`, or `adrp` — the tag propagates forward and
+/// the binary spends the entire instruction budget faulting through tagged
+/// pages instead of running real code.
+fn rewrite_tagged_fetch_pc<'a>(
+    uc: &mut Unicorn<'a, ()>,
+    fault_addr: u64,
+    pc: u64,
+    canonical: u64,
+) -> Option<(u64, u64)> {
+    if pc != fault_addr || canonical == fault_addr {
+        return None;
+    }
+    if uc.mem_read_as_vec(canonical, 4).is_err() {
+        return None;
+    }
+    uc.reg_write(RegisterARM64::PC as i32, canonical).ok()?;
+    Some((fault_addr, canonical))
+}
+
 pub struct UnicornEmulator {
     uc: Unicorn<'static, ()>,
     arch: ArchType,
@@ -511,11 +533,20 @@ impl UnicornEmulator {
                     }
                 }
                 if let Some((fault_addr, candidate)) = map_tagged_alias_page(uc, addr, pc) {
-                    let event = arm64_memory_event("tagged-pointer-alias")
+                    let mut event = arm64_memory_event("tagged-pointer-alias")
                         .arg("FaultAddr", format!("0x{:X}", fault_addr))
                         .arg("Candidate", format!("0x{:X}", candidate))
                         .arg("Memtype", format!("{:?}", mem_type))
                         .arg("pc", format!("0x{:X}", pc));
+                    if matches!(mem_type, MemType::FETCH_UNMAPPED) && pc == fault_addr {
+                        if let Some((rewrote_from, rewrote_to)) =
+                            rewrite_tagged_fetch_pc(uc, fault_addr, pc, candidate)
+                        {
+                            event = event
+                                .arg("PcRewriteFrom", format!("0x{:X}", rewrote_from))
+                                .arg("PcRewriteTo", format!("0x{:X}", rewrote_to));
+                        }
+                    }
                     emit_arm64_event(&trace_bus_for_memhook, event);
                     return true;
                 }

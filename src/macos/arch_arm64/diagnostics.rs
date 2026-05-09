@@ -344,8 +344,8 @@ pub fn run_arm64_with_diagnostics(
         emit_runner_trace_event(&report.trace_bus, &metadata, event);
     };
 
-    let timeout_usecs = env_u64("MACHINA_TIMEOUT_USECS", 15_000_000);
-    let instruction_count = env_usize("MACHINA_MAX_INSTRUCTIONS", 10_000_000);
+    let timeout_usecs = env_u64("MACHINA_TIMEOUT_USECS", 30_000_000);
+    let instruction_count = env_usize("MACHINA_MAX_INSTRUCTIONS", 50_000_000);
     let start = Instant::now();
     match emulator.run_with_limits(report.actual_entry, None, timeout_usecs, instruction_count) {
         Ok(()) => {
