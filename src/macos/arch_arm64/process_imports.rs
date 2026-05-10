@@ -19,13 +19,65 @@ use crate::macos::arm64_runner_support::{
 use crate::macos::{
     close_synthetic_fd, dispatch_pending_arm64_thread, dispatch_pending_arm64_thread_by_id,
     read_arm64_argv, read_cstring, resolve_process_fd_target, restore_arm64_context,
-    save_arm64_context, terminate_synthetic_process, ActiveArm64Thread, Emulator, ForkParentResume,
-    PendingArm64Thread, SharedTraceBus, SyntheticFdTarget, SyntheticProcess, MAX_SYNTHETIC_THREADS,
+    sanitize_capture_label, save_arm64_context, terminate_synthetic_process, ActiveArm64Thread,
+    Emulator, ForkParentResume, PendingArm64Thread, SharedTraceBus, SyntheticFdTarget,
+    SyntheticProcess, MAX_SYNTHETIC_THREADS,
 };
 use crate::UnicornEmulator;
 
 fn vec_u64_le(bytes: Vec<u8>) -> Option<u64> {
     <[u8; 8]>::try_from(bytes).ok().map(u64::from_le_bytes)
+}
+
+/// Dump the resolved `posix_spawnp` invocation (path + argv + envp
+/// pointer) to `target/machina-captures/spawn_pid<parent>_child<child>_<seq>.cmd`.
+///
+/// `_write` only captures bytes the malware sends through `_write(2)`.
+/// The remote-command surface — `osascript display dialog ...`,
+/// `chflags hidden npm`, `chmod +x npm`, `zsh -c zip -r ...`,
+/// `zsh -c curl ...`, `zsh -c mdfind -name .pem`, etc. — never goes
+/// through `_write`; the malware composes the argv and hands it to
+/// `posix_spawnp`. A per-spawn artifact file makes those argvs
+/// inspectable end-to-end alongside the file-write dumps.
+///
+/// Returns the path written on success.
+fn append_posix_spawn_argv_to_capture(
+    parent_pid: u64,
+    child_pid: u64,
+    sequence: usize,
+    path: &str,
+    argv: &[String],
+    envp_ptr: u64,
+) -> Option<std::path::PathBuf> {
+    let capture_dir = std::env::var_os("MACHINA_PAYLOAD_DUMP_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::Path::new("target").join("machina-captures"));
+    if std::fs::create_dir_all(&capture_dir).is_err() {
+        return None;
+    }
+    let safe_label = sanitize_capture_label(path);
+    let label = if safe_label.is_empty() {
+        "unknown".to_string()
+    } else {
+        safe_label
+    };
+    let file_path = capture_dir.join(format!(
+        "spawn_pid{}_child{}_seq{}_{}.cmd",
+        parent_pid, child_pid, sequence, label
+    ));
+    let mut body = String::new();
+    body.push_str(&format!("# parent_pid={}\n", parent_pid));
+    body.push_str(&format!("# child_pid={}\n", child_pid));
+    body.push_str(&format!("# sequence={}\n", sequence));
+    body.push_str(&format!("# envp=0x{:X}\n", envp_ptr));
+    body.push_str(&format!("path={}\n", path));
+    for (i, arg) in argv.iter().enumerate() {
+        body.push_str(&format!("argv[{}]={}\n", i, arg));
+    }
+    if std::fs::write(&file_path, body).is_err() {
+        return None;
+    }
+    Some(file_path)
 }
 
 fn extract_log_stream_event_messages(predicate: &str) -> Vec<String> {
@@ -90,6 +142,9 @@ fn install_posix_spawn_hook(
     let thread_runtime = shared_state.thread_runtime.clone();
     let import_tracker = import_tracker.clone();
     let trace_bus_for_hook = trace_bus.clone();
+    // Per-installation sequence counter so multiple `posix_spawnp`
+    // calls from the same parent get distinct dump files.
+    let spawn_sequence = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     emulator.add_code_hook(
         addr,
         addr + 4,
@@ -175,7 +230,28 @@ fn install_posix_spawn_hook(
                     call_name, pid_ptr, path, argv, file_actions_ptr, file_actions, attr_ptr, envp_ptr, result, child_pid, synthesize_log_stream
                 ),
             );
-            let event = arm64_process_event(current_pid, current_tid, call_name, call_name)
+            let sequence = spawn_sequence
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let dump_path = append_posix_spawn_argv_to_capture(
+                current_pid,
+                child_pid,
+                sequence,
+                &path,
+                &argv,
+                envp_ptr,
+            );
+            if let Some(dump_path) = &dump_path {
+                println!(
+                    "[CAPTURE][arm64] posix-spawn argv pid={} tid={} child_pid={} seq={} path={} dump={}",
+                    current_pid,
+                    current_tid,
+                    child_pid,
+                    sequence,
+                    path,
+                    dump_path.display()
+                );
+            }
+            let mut event = arm64_process_event(current_pid, current_tid, call_name, call_name)
                 .arg("PidPtr", format!("0x{:X}", pid_ptr))
                 .arg("ChildPid", child_pid.to_string())
                 .arg("Path", path)
@@ -187,7 +263,11 @@ fn install_posix_spawn_hook(
                 .arg("SyntheticLogStream", synthesize_log_stream.to_string())
                 .arg("SyntheticLogMessages", format!("{:?}", log_stream_messages))
                 .arg("Errno", errno.to_string())
-                .arg("Result", result.to_string());
+                .arg("Result", result.to_string())
+                .arg("ArgvDumpSeq", sequence.to_string());
+            if let Some(dump_path) = dump_path {
+                event = event.arg("ArgvDumpFile", dump_path.display().to_string());
+            }
             emit_arm64_event(&trace_bus_for_hook, event);
         },
     )?;
